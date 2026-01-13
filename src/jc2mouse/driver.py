@@ -228,7 +228,8 @@ class JC2OpticalMouse:
             print(f"opt={list(opt)} x16={x16:5d} y16={y16:5d} dx={dx:+6d} dy={dy:+6d} -> {mdx:+4d},{mdy:+4d}", file=sys.stderr)
             self.last_dbg = now
 
-        async def _refresh_objects_until_gatt(self, timeout_s: float = 60.0):
+    async def _refresh_objects_until_gatt(self, timeout_s: float = 60.0):
+        """Poll BlueZ until *our* notify/control UUIDs appear under the device."""
         deadline = time.time() + timeout_s
         last_msg = 0.0
 
@@ -268,9 +269,7 @@ class JC2OpticalMouse:
 
             await asyncio.sleep(0.25)
 
-        return False
-
-
+        return False 
 
 async def run(mac: str):
     drv = JC2OpticalMouse(mac)

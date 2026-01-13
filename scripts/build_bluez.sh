@@ -146,7 +146,7 @@ apply_patch_att_timeout_quirk() {
   local tmp
   tmp="$(mktemp)"
 
-  awk '
+    awk '
     BEGIN { inserted=0 }
     {
       print $0
@@ -155,25 +155,24 @@ apply_patch_att_timeout_quirk() {
         print ""
         print "\t/*"
         print "\t * Joy-Con 2 quirk:"
-        print "\t * Secondary Service discovery (Read By Group Type, group type 0x2801)"
-        print "\t * may never respond. Do not terminate the ATT bearer; synthesize an"
-        print "\t * Error Response and continue."
+        print "\t * Read By Group Type (0x10) may time out during discovery on Joy-Con 2."
+        print "\t * Do not terminate the ATT bearer; synthesize an Error Response and continue."
         print "\t */"
-        print "\tif (op->opcode == BT_ATT_OP_READ_BY_GRP_TYPE_REQ && op->callback && op->pdu && op->len >= 6) {"
-        print "\t\tuint16_t group_type = get_le16(op->pdu + 4);"
-        print "\t\tif (group_type == 0x2801) {"
-        print "\t\t\tuint8_t err_pdu[4];"
-        print "\t\t\tuint16_t handle = get_le16(op->pdu);"
+        print "\tif (op->opcode == BT_ATT_OP_READ_BY_GRP_TYPE_REQ && op->callback) {"
+        print "\t\tuint8_t err_pdu[4];"
+        print "\t\tuint16_t handle = 0x0001;"
         print ""
-        print "\t\t\terr_pdu[0] = op->opcode; /* request opcode */"
-        print "\t\t\tput_le16(handle, &err_pdu[1]);"
-        print "\t\t\terr_pdu[3] = BT_ATT_ERROR_UNSUPPORTED_GROUP_TYPE;"
+        print "\t\tif (op->pdu && op->len >= 2)"
+        print "\t\t\thandle = get_le16(op->pdu);"
         print ""
-        print "\t\t\top->callback(BT_ATT_OP_ERROR_RSP, err_pdu, sizeof(err_pdu), op->user_data);"
-        print "\t\t\tdestroy_att_send_op(op);"
-        print "\t\t\twakeup_chan_writer(chan, NULL);"
-        print "\t\t\treturn false;"
-        print "\t\t}"
+        print "\t\terr_pdu[0] = op->opcode; /* request opcode */"
+        print "\t\tput_le16(handle, &err_pdu[1]);"
+        print "\t\terr_pdu[3] = BT_ATT_ERROR_UNSUPPORTED_GROUP_TYPE;"
+        print ""
+        print "\t\top->callback(BT_ATT_OP_ERROR_RSP, err_pdu, sizeof(err_pdu), op->user_data);"
+        print "\t\tdestroy_att_send_op(op);"
+        print "\t\twakeup_chan_writer(chan, NULL);"
+        print "\t\treturn false;"
         print "\t}"
         print ""
 

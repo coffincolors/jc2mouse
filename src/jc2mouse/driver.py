@@ -88,8 +88,18 @@ class JC2OpticalMouse:
             if self.dev_path and not path.startswith(self.dev_path + "/"):
                 continue
 
-            uuid = str(ch.get("UUID", "")).lower()
-            flags = [str(x).lower() for x in ch.get("Flags", [])]
+            #uuid = str(ch.get("UUID", "")).lower()
+            #flags = [str(x).lower() for x in ch.get("Flags", [])]
+
+            uuid_v = ch.get("UUID")
+            flags_v = ch.get("Flags")
+
+            uuid = str(getattr(uuid_v, "value", uuid_v) or "").lower()
+
+            flags_raw = getattr(flags_v, "value", flags_v) or []
+            # flags_raw should be a list of strings
+            flags = [str(x).lower() for x in flags_raw]
+
 
             if "notify" in flags:
                 notify.append((path, uuid, flags))

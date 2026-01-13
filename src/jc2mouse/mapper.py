@@ -202,7 +202,7 @@ def mode_byte(pkts: list[bytes], idx: int) -> int | None:
     return c.most_common(1)[0][0]
 
 
-def diff_stable_xor(base_pkts: list[bytes], press_pkts: list[bytes], max_len: int = 64) -> list[tuple[int,int,int,int]]:
+def diff_stable_xor(base_pkts: list[bytes], press_pkts: list[bytes], max_len: int = 8) -> list[tuple[int,int,int,int]]:
     """
     Return list of (idx, xor, hits, total) for bytes that:
       - are stable in baseline and pressed

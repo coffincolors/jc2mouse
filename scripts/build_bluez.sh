@@ -54,8 +54,16 @@ apply_patch_force_medium() {
   #
   # This avoids brittle line-number patches.
   perl -0777 -i -pe '
-    s/(if\s*\(\s*dev->le_state\.paired\s*\)\s*\{\s*sec_level\s*=\s*BT_IO_SEC_MEDIUM;\s*\}\s*else\s*\{\s*sec_level\s*=\s*)BT_IO_SEC_LOW(\s*;\s*\})/${1}BT_IO_SEC_MEDIUM$2/s
-  ' "$f"
+  s/if\s*\(\s*dev->le_state\.paired\s*\)\s*\n\s*sec_level\s*=\s*BT_IO_SEC_MEDIUM\s*;\s*\n\s*else\s*\n\s*sec_level\s*=\s*BT_IO_SEC_LOW\s*;/
+    "if (dev->le_state.paired)\n\tsec_level = BT_IO_SEC_MEDIUM;\nelse\n\tsec_level = BT_IO_SEC_MEDIUM;"/se
+' "$f"
+
+  python3 - <<'PY'
+  import re, pathlib, sys
+  p = pathlib.Path("bluez-src/bluez-5.72/src/device.c").read_text()
+  m = re.search(r'if\s*\(\s*dev->le_state\.paired\s*\)\s*\n\s*sec_level\s*=\s*BT_IO_SEC_MEDIUM\s*;\s*\n\s*else\s*\n\s*sec_level\s*=\s*(BT_IO_SEC_\w+)\s*;', p)
+  print("unpaired sec_level =", m.group(1) if m else "NOT FOUND")
+  PY
 
   # Sanity check: confirm LOW no longer appears in that function region
   if grep -n "BT_IO_SEC_LOW" "$f" >/dev/null; then

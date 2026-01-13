@@ -8,6 +8,27 @@ from dbus_next import Variant
 from dbus_next.aio import MessageBus
 from dbus_next.constants import BusType
 
+def uniq_count(pkts: list[bytes], idx: int) -> int:
+    s = set()
+    for p in pkts:
+        if idx < len(p):
+            s.add(p[idx])
+            if len(s) > 10:
+                break
+    return len(s)
+
+def most_common_xor(base_pkts: list[bytes], press_pkts: list[bytes], idx: int):
+    c = Counter()
+    n = 0
+    for b, p in zip(base_pkts, press_pkts):
+        if idx < len(b) and idx < len(p):
+            c[b[idx] ^ p[idx]] += 1
+            n += 1
+    if not c or n < 8:
+        return None
+    val, cnt = c.most_common(1)[0]
+    return val, cnt, n
+
 BLUEZ = "org.bluez"
 OM_IFACE = "org.freedesktop.DBus.ObjectManager"
 PROP_IFACE = "org.freedesktop.DBus.Properties"
@@ -181,16 +202,41 @@ def mode_byte(pkts: list[bytes], idx: int) -> int | None:
     return c.most_common(1)[0][0]
 
 
-def diff_modes(base_pkts: list[bytes], press_pkts: list[bytes], max_len: int = 64) -> list[Change]:
-    changes: list[Change] = []
+def diff_stable_xor(base_pkts: list[bytes], press_pkts: list[bytes], max_len: int = 64) -> list[tuple[int,int,int,int]]:
+    """
+    Return list of (idx, xor, hits, total) for bytes that:
+      - are stable in baseline and pressed
+      - have a consistent XOR mask
+    """
+    out = []
+    # align sizes so zip works
+    n = min(len(base_pkts), len(press_pkts))
+    base_pkts = base_pkts[:n]
+    press_pkts = press_pkts[:n]
+
     for i in range(max_len):
-        b = mode_byte(base_pkts, i)
-        p = mode_byte(press_pkts, i)
-        if b is None or p is None:
+        if uniq_count(base_pkts, i) > 2:
             continue
-        if b != p:
-            changes.append(Change(i, b, p, b ^ p))
-    return changes
+        if uniq_count(press_pkts, i) > 2:
+            continue
+
+        mc = most_common_xor(base_pkts, press_pkts, i)
+        if not mc:
+            continue
+        xor, hits, total = mc
+
+        # ignore "no change"
+        if xor == 0:
+            continue
+
+        # require consistency
+        if hits / max(1, total) < 0.65:
+            continue
+
+        out.append((i, xor, hits, total))
+
+    return out
+
 
 
 async def run_button_wizard(mac: str):
@@ -221,13 +267,24 @@ async def run_button_wizard(mac: str):
 
     for name, prompt in buttons:
         await mapper._drain()
-        print(f"\n--- {name} ---", file=sys.stderr)
-        print(f"{prompt}. DO NOT press anything for 1s...", file=sys.stderr)
-        base = await mapper.capture(1.0)
+        input(f"\n--- {name} ---\n{prompt}\n1) Keep still, press Enter to capture BASELINE...")
+        base = await mapper.capture(1.2)
 
         await mapper._drain()
-        print(f"Now HOLD {name} for 1s...", file=sys.stderr)
-        pressed = await mapper.capture(1.0)
+        input(f"2) Now HOLD {name}, press Enter to capture PRESSED (keep holding while it captures)...")
+        pressed = await mapper.capture(1.2)
+
+        input(f"3) Release {name}, press Enter to continue...")
+
+        ch = diff_stable_xor(base, pressed, max_len=64)
+        report[name] = ch
+
+        if not ch:
+            print("No stable XOR changes detected (try again; hold more firmly).", file=sys.stderr)
+        else:
+            for (idx, xor, hits, total) in ch:
+                print(f"byte[{idx:02d}] xor=0x{xor:02x} (hits {hits}/{total})", file=sys.stderr)
+
 
         ch = diff_modes(base, pressed, max_len=64)
         report[name] = ch
@@ -244,10 +301,11 @@ async def run_button_wizard(mac: str):
         await asyncio.sleep(0.5)
 
     # Print a final condensed report
-    print("\n===== jc2 button map report (mode-by-byte, first 64 bytes) =====")
+    print("\n===== jc2 button map report (stable XOR, first 64 bytes) =====")
     for name, changes in report.items():
         if not changes:
-            print(f"{name}: (no stable changes)")
+            print(f"{name}: (no stable XOR)")
             continue
-        parts = [f"{c.idx}:0x{c.xor:02x}" for c in changes]
+        parts = [f"{idx}:0x{xor:02x}" for (idx, xor, _hits, _total) in changes]
         print(f"{name}: " + " ".join(parts))
+

@@ -141,14 +141,60 @@ apply_patch_att_timeout_quirk() {
     ' "$f"
   fi
 
-  # 2) Insert quirk block right after "op->timeout_id = 0;" and BEFORE disc_att_send_op(op);
-  # Only triggers for opcode 0x10 where group type == 0x2801, then synthesizes an Error Response and returns without io_shutdown.
-  perl -0777 -i -pe '
-    s/(op->timeout_id\s*=\s*0;\s*\n)(\s*disc_att_send_op\s*\(\s*op\s*\)\s*;\s*\n)/
-$1
-\t/*\n\t * Joy-Con 2 quirk:\n\t * Secondary Service discovery (Read By Group Type, group type 0x2801)\n\t * may never respond. Do not terminate the ATT bearer; synthesize an\n\t * Error Response and continue.\n\t */\n\tif (op->opcode == BT_ATT_OP_READ_BY_GRP_TYPE_REQ && op->callback && op->pdu && op->len >= 6) {\n\t\tuint16_t group_type = get_le16(op->pdu + 4);\n\t\tif (group_type == 0x2801) {\n\t\t\tuint8_t err_pdu[4];\n\t\t\tuint16_t handle = get_le16(op->pdu);\n\n\t\t\terr_pdu[0] = op->opcode; /* request opcode */\n\t\t\tput_le16(handle, &err_pdu[1]);\n\t\t\terr_pdu[3] = BT_ATT_ERROR_UNSUPPORTED_GROUP_TYPE;\n\n\t\t\top->callback(BT_ATT_OP_ERROR_RSP, err_pdu, sizeof(err_pdu), op->user_data);\n\t\t\tdestroy_att_send_op(op);\n\t\t\twakeup_chan_writer(chan, NULL);\n\t\t\treturn false;\n\t\t}\n\t}\n$2
-/s
-  ' "$f"
+  # 2) Insert quirk block after "op->timeout_id = 0;" and before "disc_att_send_op(op);"
+  # Do it with awk to avoid perl escape issues.
+  local tmp
+  tmp="$(mktemp)"
+
+  awk '
+    BEGIN { inserted=0 }
+    {
+      print $0
+
+      if (!inserted && $0 ~ /op->timeout_id[[:space:]]*=[[:space:]]*0;[[:space:]]*$/) {
+        print ""
+        print "\t/*"
+        print "\t * Joy-Con 2 quirk:"
+        print "\t * Secondary Service discovery (Read By Group Type, group type 0x2801)"
+        print "\t * may never respond. Do not terminate the ATT bearer; synthesize an"
+        print "\t * Error Response and continue."
+        print "\t */"
+        print "\tif (op->opcode == BT_ATT_OP_READ_BY_GRP_TYPE_REQ && op->callback && op->pdu && op->len >= 6) {"
+        print "\t\tuint16_t group_type = get_le16(op->pdu + 4);"
+        print "\t\tif (group_type == 0x2801) {"
+        print "\t\t\tuint8_t err_pdu[4];"
+        print "\t\t\tuint16_t handle = get_le16(op->pdu);"
+        print ""
+        print "\t\t\terr_pdu[0] = op->opcode; /* request opcode */"
+        print "\t\t\tput_le16(handle, &err_pdu[1]);"
+        print "\t\t\terr_pdu[3] = BT_ATT_ERROR_UNSUPPORTED_GROUP_TYPE;"
+        print ""
+        print "\t\t\top->callback(BT_ATT_OP_ERROR_RSP, err_pdu, sizeof(err_pdu), op->user_data);"
+        print "\t\t\tdestroy_att_send_op(op);"
+        print "\t\t\twakeup_chan_writer(chan, NULL);"
+        print "\t\t\treturn false;"
+        print "\t\t}"
+        print "\t}"
+        print ""
+
+        inserted=1
+      }
+    }
+    END {
+      if (!inserted) exit 42
+    }
+  ' "$f" > "$tmp" || {
+    rc=$?
+    rm -f "$tmp"
+    if [ "$rc" -eq 42 ]; then
+      echo "[bluez] ERROR: could not find anchor line \"op->timeout_id = 0;\" in att.c" >&2
+      exit 6
+    fi
+    echo "[bluez] ERROR: awk insert failed" >&2
+    exit 7
+  }
+
+  mv "$tmp" "$f"
 
   # 3) Verify the patch landed
   if ! grep -n "Joy-Con 2 quirk" "$f" >/dev/null; then

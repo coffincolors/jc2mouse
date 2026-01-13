@@ -118,6 +118,46 @@ apply_patch_ignore_secondary_timeout() {
   fi
 }
 
+apply_patch_att_timeout_quirk() {
+  local f="${SRC_DIR}/bluez-${BLUEZ_VER}/src/shared/att.c"
+
+  if [[ ! -f "$f" ]]; then
+    echo "ERROR: expected file not found: $f" >&2
+    exit 1
+  fi
+
+  echo "[bluez] Patching att.c timeout_cb() to avoid disconnect on secondary service discovery timeout..."
+
+  # 1) Ensure wakeup_chan_writer is forward-declared before timeout_cb
+  # (prevents implicit declaration -> static redeclaration error)
+  if ! awk '
+      /static bool timeout_cb/ { seen_timeout=1 }
+      /static void wakeup_chan_writer/ && !seen_timeout { found=1 }
+      END { exit(found ? 0 : 1) }
+    ' "$f"
+  then
+    perl -0777 -i -pe '
+      s/(static bool timeout_cb\s*\(void \*user_data\)\s*\n\{)/static void wakeup_chan_writer(void *data, void *user_data);\n\n$1/s
+    ' "$f"
+  fi
+
+  # 2) Insert quirk block right after "op->timeout_id = 0;" and BEFORE disc_att_send_op(op);
+  # Only triggers for opcode 0x10 where group type == 0x2801, then synthesizes an Error Response and returns without io_shutdown.
+  perl -0777 -i -pe '
+    s/(op->timeout_id\s*=\s*0;\s*\n)(\s*disc_att_send_op\s*\(\s*op\s*\)\s*;\s*\n)/
+$1
+\t/*\n\t * Joy-Con 2 quirk:\n\t * Secondary Service discovery (Read By Group Type, group type 0x2801)\n\t * may never respond. Do not terminate the ATT bearer; synthesize an\n\t * Error Response and continue.\n\t */\n\tif (op->opcode == BT_ATT_OP_READ_BY_GRP_TYPE_REQ && op->callback && op->pdu && op->len >= 6) {\n\t\tuint16_t group_type = get_le16(op->pdu + 4);\n\t\tif (group_type == 0x2801) {\n\t\t\tuint8_t err_pdu[4];\n\t\t\tuint16_t handle = get_le16(op->pdu);\n\n\t\t\terr_pdu[0] = op->opcode; /* request opcode */\n\t\t\tput_le16(handle, &err_pdu[1]);\n\t\t\terr_pdu[3] = BT_ATT_ERROR_UNSUPPORTED_GROUP_TYPE;\n\n\t\t\top->callback(BT_ATT_OP_ERROR_RSP, err_pdu, sizeof(err_pdu), op->user_data);\n\t\t\tdestroy_att_send_op(op);\n\t\t\twakeup_chan_writer(chan, NULL);\n\t\t\treturn false;\n\t\t}\n\t}\n$2
+/s
+  ' "$f"
+
+  # 3) Verify the patch landed
+  if ! grep -n "Joy-Con 2 quirk" "$f" >/dev/null; then
+    echo "[bluez] ERROR: att.c timeout quirk patch did not apply" >&2
+    exit 5
+  fi
+}
+
+
 build_and_install() {
   rm -rf "${BLD_DIR}"
   mkdir -p "${BLD_DIR}"
@@ -146,7 +186,8 @@ main() {
   ensure_deps
   fetch
   apply_patch_force_medium
-  apply_patch_ignore_secondary_timeout
+  #apply_patch_ignore_secondary_timeout
+  apply_patch_att_timeout_quirk
   build_and_install
 
   echo

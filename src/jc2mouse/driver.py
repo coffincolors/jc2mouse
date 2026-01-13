@@ -95,44 +95,32 @@ class JC2OpticalMouse:
             if self.dev_path and not path.startswith(self.dev_path + "/"):
                 continue
 
-            #uuid = str(ch.get("UUID", "")).lower()
-            #flags = [str(x).lower() for x in ch.get("Flags", [])]
-
             uuid_v = ch.get("UUID")
             flags_v = ch.get("Flags")
 
             uuid = str(getattr(uuid_v, "value", uuid_v) or "").lower()
-
             flags_raw = getattr(flags_v, "value", flags_v) or []
-            # flags_raw should be a list of strings
             flags = [str(x).lower() for x in flags_raw]
 
-
             if "notify" in flags:
-                notify.append((path, uuid, flags))
+                notify.append((path, uuid))
             if ("write-without-response" in flags) or ("write" in flags):
-                writable.append((path, uuid, flags))
+                writable.append((path, uuid))
 
         def by_uuid(cands, want):
-            for p, u, _f in cands:
+            for p, u in cands:
                 if u == want:
                     return p
             return None
 
-        if self.notify_uuid:
-            self.notify_path = by_uuid(notify, self.notify_uuid)
-        else:
-            self.notify_path = notify[0][0] if notify else None
+        # We ALWAYS have defaults now, so require exact matches
+        self.notify_path = by_uuid(notify, self.notify_uuid)
+        if not self.notify_path:
+            raise RuntimeError(f"Notify characteristic UUID not found: {self.notify_uuid}")
 
-        if self.ctrl_uuid:
-            self.ctrl_path = by_uuid(writable, self.ctrl_uuid)
-        else:
-            # prefer write-without-response
-            wwr = [c for c in writable if "write-without-response" in c[2]]
-            self.ctrl_path = (wwr[0][0] if wwr else (writable[0][0] if writable else None))
-
-        if not self.notify_path or not self.ctrl_path:
-            raise RuntimeError("Could not auto-pick notify/control characteristics. We’ll add a scan command next to print UUIDs.")
+        self.ctrl_path = by_uuid(writable, self.ctrl_uuid)
+        if not self.ctrl_path:
+            raise RuntimeError(f"Control characteristic UUID not found: {self.ctrl_uuid}")
 
     async def connect(self):
         self.bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
@@ -240,32 +228,48 @@ class JC2OpticalMouse:
             print(f"opt={list(opt)} x16={x16:5d} y16={y16:5d} dx={dx:+6d} dy={dy:+6d} -> {mdx:+4d},{mdy:+4d}", file=sys.stderr)
             self.last_dbg = now
 
-    async def _refresh_objects_until_gatt(self, timeout_s: float = 8.0):
-        """Poll BlueZ until remote GATT characteristics appear under the device."""
+        async def _refresh_objects_until_gatt(self, timeout_s: float = 60.0):
         deadline = time.time() + timeout_s
-        last_count = -1
+        last_msg = 0.0
+
+        want_notify = self.notify_uuid
+        want_ctrl = self.ctrl_uuid
 
         while time.time() < deadline:
             self.objects = await self._get_managed_objects()
 
-            # count characteristics under this device
-            count = 0
+            found_notify = False
+            found_ctrl = False
+            total = 0
+
             for path, ifaces in self.objects.items():
-                if GATT_CHRC_IFACE not in ifaces:
+                ch = ifaces.get(GATT_CHRC_IFACE)
+                if not ch:
                     continue
-                if self.dev_path and path.startswith(self.dev_path + "/"):
-                    count += 1
+                if self.dev_path and not path.startswith(self.dev_path + "/"):
+                    continue
 
-            if count != last_count:
-                print(f"[jc2] GATT chrc seen so far: {count}", file=sys.stderr)
-                last_count = count
+                total += 1
+                uuid_v = ch.get("UUID")
+                uuid = str(getattr(uuid_v, "value", uuid_v) or "").lower()
 
-            if count > 0:
+                if uuid == want_notify:
+                    found_notify = True
+                if uuid == want_ctrl:
+                    found_ctrl = True
+
+            now = time.time()
+            if now - last_msg > 0.5:
+                print(f"[jc2] GATT chrc={total} have_notify={found_notify} have_ctrl={found_ctrl}", file=sys.stderr)
+                last_msg = now
+
+            if found_notify and found_ctrl:
                 return True
 
             await asyncio.sleep(0.25)
 
         return False
+
 
 
 async def run(mac: str):

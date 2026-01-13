@@ -48,27 +48,46 @@ apply_patch_force_medium() {
 
   echo "[bluez] Patching device_connect_le() to force BT_IO_SEC_MEDIUM for unpaired LE..."
 
-  # We patch the specific if/else that sets sec_level based on paired.
-  # This is a targeted text substitution: change BT_IO_SEC_LOW -> BT_IO_SEC_MEDIUM
-  # but only in the "else" branch directly under "if (dev->le_state.paired)" context.
+  # Replace the exact 4-line sec_level selection block:
+  #   if (dev->le_state.paired)
+  #       sec_level = BT_IO_SEC_MEDIUM;
+  #   else
+  #       sec_level = BT_IO_SEC_LOW;
   #
-  # This avoids brittle line-number patches.
+  # with:
+  #   if (dev->le_state.paired)
+  #       sec_level = BT_IO_SEC_MEDIUM;
+  #   else
+  #       sec_level = BT_IO_SEC_MEDIUM;
+  #
+  # This assumes BlueZ 5.72 uses that structure (it does, per your grep).
+
   perl -0777 -i -pe '
-  s/if\s*\(\s*dev->le_state\.paired\s*\)\s*\n\s*sec_level\s*=\s*BT_IO_SEC_MEDIUM\s*;\s*\n\s*else\s*\n\s*sec_level\s*=\s*BT_IO_SEC_LOW\s*;/
-    "if (dev->le_state.paired)\n\tsec_level = BT_IO_SEC_MEDIUM;\nelse\n\tsec_level = BT_IO_SEC_MEDIUM;"/se
-' "$f"
+    s/if\s*\(\s*dev->le_state\.paired\s*\)\s*\n\s*sec_level\s*=\s*BT_IO_SEC_MEDIUM\s*;\s*\n\s*else\s*\n\s*sec_level\s*=\s*BT_IO_SEC_LOW\s*;/
+      "if (dev->le_state.paired)\n\tsec_level = BT_IO_SEC_MEDIUM;\nelse\n\tsec_level = BT_IO_SEC_MEDIUM;"/se
+  ' "$f"
 
-  python3 - <<'PY'
-  import re, pathlib, sys
-  p = pathlib.Path("bluez-src/bluez-5.72/src/device.c").read_text()
-  m = re.search(r'if\s*\(\s*dev->le_state\.paired\s*\)\s*\n\s*sec_level\s*=\s*BT_IO_SEC_MEDIUM\s*;\s*\n\s*else\s*\n\s*sec_level\s*=\s*(BT_IO_SEC_\w+)\s*;', p)
-  print("unpaired sec_level =", m.group(1) if m else "NOT FOUND")
-  PY
+  # Validate we actually changed the unpaired branch
+  python3 - "$f" <<'PY'
+import re, pathlib, sys
+f = pathlib.Path(sys.argv[1])
+t = f.read_text()
 
-  # Sanity check: confirm LOW no longer appears in that function region
-  if grep -n "BT_IO_SEC_LOW" "$f" >/dev/null; then
-    echo "[warn] BT_IO_SEC_LOW still present somewhere in device.c (may be unrelated)."
-  fi
+# Find the specific paired/unpaired assignment nearby.
+m = re.search(
+    r'if\s*\(\s*dev->le_state\.paired\s*\)\s*\n\s*sec_level\s*=\s*BT_IO_SEC_MEDIUM\s*;\s*\n\s*else\s*\n\s*sec_level\s*=\s*(BT_IO_SEC_\w+)\s*;',
+    t
+)
+
+if not m:
+    print("[bluez] ERROR: could not find expected sec_level if/else block to patch")
+    sys.exit(2)
+
+print("[bluez] unpaired sec_level =", m.group(1))
+if m.group(1) != "BT_IO_SEC_MEDIUM":
+    print("[bluez] ERROR: patch did not set unpaired sec_level to BT_IO_SEC_MEDIUM")
+    sys.exit(3)
+PY
 }
 
 build_and_install() {

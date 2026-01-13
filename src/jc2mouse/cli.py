@@ -6,6 +6,8 @@ import subprocess
 
 from jc2mouse.driver import run as run_driver
 
+from jc2mouse.mapper import run_button_wizard
+
 def _require_root():
     if os.geteuid() != 0:
         print("ERROR: must run as root (sudo) for uinput + bluetooth session control", file=sys.stderr)
@@ -25,6 +27,9 @@ def main():
     p_run = sub.add_parser("run", help="Run optical mouse driver (requires session mode active)")
     p_run.add_argument("--mac", required=True, help="Joy-Con 2 MAC address (e.g. 98:E2:55:DF:56:13)")
 
+    p_map = sub.add_parser("dev-map-buttons", help="Developer: interactively discover button bit/byte positions")
+    p_map.add_argument("--mac", required=True, help="Joy-Con 2 MAC address")
+
     args = ap.parse_args()
     _require_root()
 
@@ -40,6 +45,12 @@ def main():
     if args.cmd == "run":
         try:
             asyncio.run(run_driver(args.mac))
+        except KeyboardInterrupt:
+            print("\n[jc2] Stopped.", file=sys.stderr)
+        return 0
+    if args.cmd == "dev-map-buttons":
+        try:
+            asyncio.run(run_button_wizard(args.mac))
         except KeyboardInterrupt:
             print("\n[jc2] Stopped.", file=sys.stderr)
         return 0

@@ -8,7 +8,7 @@ Conflicts=bluetooth.service
 [Service]
 Type=simple
 # This path will be created by our setup script:
-ExecStart=/opt/jc2mouse/bluez/sbin/bluetoothd -n -d
+ExecStart=/opt/jc2mouse/bluez/libexec/bluetooth/bluetoothd -n -d
 Restart=on-failure
 RestartSec=1
 

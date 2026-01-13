@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jc2mouse"
+version = "0.0.1"
+description = "Joy-Con 2 optical mouse driver (bondless) with session-mode BlueZ takeover"
+requires-python = ">=3.9"
+dependencies = [
+  "dbus-next>=0.2.3",
+  "evdev>=1.6.1",
+]
+
+[project.scripts]
+jc2mouse = "jc2mouse.cli:main"

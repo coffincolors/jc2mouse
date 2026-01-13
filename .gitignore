@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+dist/
+build/
+*.egg-info/
+*.log
+/tmp/
+bluez-src/
+bluez-build/

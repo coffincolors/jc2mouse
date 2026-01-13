@@ -90,6 +90,34 @@ if m.group(1) != "BT_IO_SEC_MEDIUM":
 PY
 }
 
+apply_patch_ignore_secondary_timeout() {
+  local f="${SRC_DIR}/bluez-${BLUEZ_VER}/src/shared/gatt-client.c"
+
+  if [[ ! -f "$f" ]]; then
+    echo "ERROR: expected file not found: $f" >&2
+    exit 1
+  fi
+
+  echo "[bluez] Patching gatt-client to ignore Secondary discovery timeout (att_ecode == 0x00)..."
+
+  # Insert after the "Secondary service discovery failed" debug print:
+  #   if (att_ecode == 0x00)
+  #       goto next;
+  #
+  # so BlueZ continues instead of failing init on timeout.
+
+  perl -0777 -i -pe '
+    s/(Secondary service discovery failed\.\s*"\s*ATT ECODE: 0x%02x",\s*att_ecode\);\s*)/
+      $1 . "if (att_ecode == 0x00)\n\t\tgoto next;\n"/se
+  ' "$f"
+
+  # Quick sanity check
+  if ! grep -n "att_ecode == 0x00" "$f" >/dev/null; then
+    echo "[bluez] ERROR: secondary timeout ignore patch did not apply" >&2
+    exit 4
+  fi
+}
+
 build_and_install() {
   rm -rf "${BLD_DIR}"
   mkdir -p "${BLD_DIR}"
@@ -118,6 +146,7 @@ main() {
   ensure_deps
   fetch
   apply_patch_force_medium
+  apply_patch_ignore_secondary_timeout
   build_and_install
 
   echo

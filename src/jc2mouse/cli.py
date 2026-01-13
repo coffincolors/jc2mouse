@@ -38,7 +38,10 @@ def main():
         _call_session("stop")
         return 0
     if args.cmd == "run":
-        asyncio.run(run_driver(args.mac))
+        try:
+            asyncio.run(run_driver(args.mac))
+        except KeyboardInterrupt:
+            print("\n[jc2] Stopped.", file=sys.stderr)
         return 0
 
     return 2

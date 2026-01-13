@@ -1,3 +1,0 @@
-# Placeholder: patch for BlueZ to force BT_IO_SEC_MEDIUM even when unpaired
-# Target: src/device.c in device_connect_le()
-# Replace LOW with MEDIUM in the unpaired branch.

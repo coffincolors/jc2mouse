@@ -189,7 +189,9 @@ class JC2OpticalMouse:
         async def write_cmd(hexstr: str):
             b = bytes.fromhex(hexstr)
             opts = {"type": Variant("s", "command")}
-            await ctrl.call_write_value(list(b), opts)
+            #await ctrl.call_write_value(list(b), opts)
+            await ctrl.call_write_value(b, opts)
+
 
         print("[jc2] Sending optical init (FF)...", file=sys.stderr)
         await write_cmd("0c91010200040000ff000000")

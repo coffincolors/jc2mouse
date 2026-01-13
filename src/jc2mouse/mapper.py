@@ -263,7 +263,7 @@ async def run_button_wizard(mac: str):
     print("[jc2 dev] For each prompt: keep controller still, then HOLD the button for ~1 second, then release.", file=sys.stderr)
     print("[jc2 dev] We’ll sample baseline (no press) and pressed (hold).", file=sys.stderr)
 
-    report: dict[str, list[Change]] = {}
+    report: dict[str, list[tuple[int,int,int,int]]] = {}
 
     for name, prompt in buttons:
         await mapper._drain()
@@ -284,21 +284,6 @@ async def run_button_wizard(mac: str):
         else:
             for (idx, xor, hits, total) in ch:
                 print(f"byte[{idx:02d}] xor=0x{xor:02x} (hits {hits}/{total})", file=sys.stderr)
-
-
-        ch = diff_modes(base, pressed, max_len=64)
-        report[name] = ch
-
-        if not ch:
-            print("No stable byte changes detected (try again / hold longer).", file=sys.stderr)
-        else:
-            for c in ch[:12]:
-                print(f"byte[{c.idx:02d}] base=0x{c.base:02x} pressed=0x{c.pressed:02x} xor=0x{c.xor:02x}", file=sys.stderr)
-            if len(ch) > 12:
-                print(f"... and {len(ch)-12} more byte(s) changed (increase max_len or inspect)", file=sys.stderr)
-
-        print("Release. Next...", file=sys.stderr)
-        await asyncio.sleep(0.5)
 
     # Print a final condensed report
     print("\n===== jc2 button map report (stable XOR, first 64 bytes) =====")

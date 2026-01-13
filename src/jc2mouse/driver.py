@@ -27,6 +27,10 @@ MAX_STEP = 200
 INVERT_X = False
 INVERT_Y = False
 
+DEFAULT_NOTIFY_UUID = "ab7de9be-89fe-49ad-828f-118f09df7fd2"
+DEFAULT_CTRL_UUID   = "649d4ac9-8eb7-4e6c-af44-1ea54fe5f005"
+
+
 def clamp(v, lo, hi):
     return lo if v < lo else hi if v > hi else v
 
@@ -41,8 +45,11 @@ def delta_u16(curr, prev):
 class JC2OpticalMouse:
     def __init__(self, mac: str, notify_uuid: str | None = None, ctrl_uuid: str | None = None):
         self.mac = mac.upper()
-        self.notify_uuid = notify_uuid.lower() if notify_uuid else None
-        self.ctrl_uuid = ctrl_uuid.lower() if ctrl_uuid else None
+        #self.notify_uuid = notify_uuid.lower() if notify_uuid else None
+        #self.ctrl_uuid = ctrl_uuid.lower() if ctrl_uuid else None
+        self.notify_uuid = (notify_uuid or DEFAULT_NOTIFY_UUID).lower()
+        self.ctrl_uuid   = (ctrl_uuid or DEFAULT_CTRL_UUID).lower()
+
 
         self.bus: MessageBus | None = None
         self.objects = None

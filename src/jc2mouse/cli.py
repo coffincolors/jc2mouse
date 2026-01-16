@@ -19,7 +19,7 @@ OM_IFACE = "org.freedesktop.DBus.ObjectManager"
 ADAPTER_IFACE = "org.bluez.Adapter1"
 DEVICE_IFACE = "org.bluez.Device1"
 
-# Manufacturer / Joy-Con 2 signature (your observed stable pattern)
+# Manufacturer / Joy-Con 2 signature (observed stable pattern)
 NINTENDO_COMPANY_ID = 0x0553
 JC2_MFG_LEN = 24
 JC2_MFG_PREFIX = bytes.fromhex("01 00 03 7e 05")  # first 5 bytes
@@ -69,7 +69,7 @@ def _rssi_live(rssi: Optional[int]) -> bool:
         return False
     if rssi <= -999:
         return False
-    # reasonable bounds (keep broad)
+    # reasonable bounds
     return -127 <= rssi <= 20
 
 
@@ -148,7 +148,7 @@ async def discover_jc2(
     bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
     objects = await _get_managed_objects(bus)
 
-    # 1) Prefer already-connected devices (this fixes your “run twice” workflow)
+    # 1) Prefer already-connected devices
     all_now: List[Dict[str, Any]] = []
     for path in objects.keys():
         c = _extract_device_candidate(objects, path)

@@ -34,15 +34,15 @@ MAX_STEP = 200
 INVERT_X = False
 INVERT_Y = False
 
-# ---- Motion smoothing / resample ----
+# ---- Motion smoothing / resample (close to perfect) ----
 MOTION_HZ = 120.0
 MOTION_MAX_PER_TICK = 60  # 60*120 = 7200/sec throughput
 MOTION_IDLE_CUTOFF_S = 0.060  # if no motion for 60ms, start braking
 MOTION_IDLE_BRAKE = 0.35  # keep 35% of backlog each tick when idle
 MOTION_IDLE_ZERO = 1.0  # if backlog smaller than this, zero it
 
-# ---- Stick location (empirically: bytes 13-15 = 3 bytes packed for X/Y 12-bit) ----
-STICK_BASE_IDX = 13  # data[13], data[14], data[15]
+# ---- Stick location (bytes 13-15 = 3 bytes packed X/Y 12-bit) ----
+STICK_BASE_IDX = 13
 
 # Stick calibration + scroll tuning
 STICK_CAL_SAMPLES = 25
@@ -54,8 +54,7 @@ SCROLL_MAX_LINES_PER_SEC = 20.0
 SCROLL_CURVE_POWER = 1.6
 SCROLL_MAX_STEP = 3
 
-
-# ---- Button bitfields ----
+# ---- Button bitfields (right Joy-Con mapping) ----
 BTN4 = 4
 BTN5 = 5
 
@@ -109,17 +108,15 @@ def decode_stick_12(b0: int, b1: int, b2: int) -> tuple[int, int]:
 
 
 class JC2OpticalMouse:
-    def __init__(
-        self,
-        mac: str,
-        notify_uuid: str | None = None,
-        ctrl_uuid: str | None = None,
-        verbose: bool = False,
-    ):
+    def __init__(self, mac: str, notify_uuid: str | None = None, ctrl_uuid: str | None = None, verbose: bool = False):
         self.mac = mac.upper()
         self.notify_uuid = (notify_uuid or DEFAULT_NOTIFY_UUID).lower()
         self.ctrl_uuid = (ctrl_uuid or DEFAULT_CTRL_UUID).lower()
         self.verbose = verbose
+
+        # Bring-up coordination / spam control
+        self._bringup_lock = asyncio.Lock()
+        self._last_warn_ts = 0.0
 
         # telemetry for one-line status
         self._notif_count = 0
@@ -129,6 +126,7 @@ class JC2OpticalMouse:
         self._last_raw_b4 = 0
         self._last_raw_b5 = 0
 
+        # “optical active” tracking (bytes 1..4 nonzero)
         self._last_opt_active_ts = 0.0
 
         # stick telemetry (raw + decoded)
@@ -166,15 +164,13 @@ class JC2OpticalMouse:
         # for status/debug correlation (minimal)
         self._last_opt_dx = 0
         self._last_opt_dy = 0
-        self._last_emit_ix = 0
-        self._last_emit_iy = 0
 
         # button edge tracking
         self._prev_left = False
         self._prev_right = False
         self._prev_middle = False
 
-        # cached GATT interfaces for restart logic (avoid re-registering callbacks)
+        # cached GATT interfaces
         self._notify_props = None
         self._notify_ch = None
         self._ctrl_ch = None
@@ -192,6 +188,11 @@ class JC2OpticalMouse:
             },
             name="jc2mouse (BlueZ D-Bus)",
         )
+
+    def _dbg(self, msg: str):
+        if self.verbose:
+            sys.stderr.write(msg + "\n")
+            sys.stderr.flush()
 
     async def _get_managed_objects(self):
         intro = await self.bus.introspect(BLUEZ, "/")
@@ -235,10 +236,9 @@ class JC2OpticalMouse:
         self.ctrl_path = ctrl_path
 
     async def _wait_services_resolved(self, timeout_s: float = 8.0) -> None:
-        """Wait until Device1.ServicesResolved becomes True."""
         dev_intro = await self.bus.introspect(BLUEZ, self.dev_path)
         dev_obj = self.bus.get_proxy_object(BLUEZ, self.dev_path, dev_intro)
-        props = dev_obj.get_interface("org.freedesktop.DBus.Properties")
+        props = dev_obj.get_interface(PROP_IFACE)
 
         deadline = time.time() + timeout_s
         while time.time() < deadline:
@@ -253,7 +253,6 @@ class JC2OpticalMouse:
         raise RuntimeError("Timed out waiting for ServicesResolved=True")
 
     async def _wait_first_notification(self, timeout_s: float = 2.0) -> bool:
-        """Return True if notif count increases within timeout."""
         start_cnt = self._notif_count
         deadline = time.time() + timeout_s
         while time.time() < deadline:
@@ -264,7 +263,6 @@ class JC2OpticalMouse:
 
     @staticmethod
     def _optical_active(opt: bytes | None) -> bool:
-        # optical stream is "on" when any of bytes 1..4 are non-zero
         return opt is not None and any(b != 0 for b in opt[1:])
 
     async def _wait_optical_active(self, timeout_s: float = 2.0) -> bool:
@@ -275,10 +273,9 @@ class JC2OpticalMouse:
             await asyncio.sleep(0.05)
         return False
 
-
     async def _refresh_objects_until_gatt(self, timeout_s: float = 60.0) -> bool:
         deadline = time.time() + timeout_s
-        last_msg = 0.0
+        last_dbg = 0.0
 
         while time.time() < deadline:
             self.objects = await self._get_managed_objects()
@@ -302,12 +299,9 @@ class JC2OpticalMouse:
                     found_ctrl = True
 
             now = time.time()
-            if now - last_msg > 0.5:
-                print(
-                    f"[jc2] GATT chrc={total} have_notify={found_notify} have_ctrl={found_ctrl}",
-                    file=sys.stderr,
-                )
-                last_msg = now
+            if self.verbose and now - last_dbg > 0.6:
+                self._dbg(f"[jc2][dbg] GATT chrc={total} have_notify={found_notify} have_ctrl={found_ctrl}")
+                last_dbg = now
 
             if found_notify and found_ctrl:
                 return True
@@ -335,7 +329,6 @@ class JC2OpticalMouse:
         try:
             await dev.call_connect()
         except Exception as ex:
-            # "AlreadyConnected" is fine
             if "Already" not in str(ex) and "already" not in str(ex):
                 raise
 
@@ -343,20 +336,16 @@ class JC2OpticalMouse:
         await self._wait_services_resolved(timeout_s=8.0)
         print("[jc2] Services resolved. Waiting for GATT discovery...", file=sys.stderr)
 
-
         ok = await self._refresh_objects_until_gatt(timeout_s=60.0)
         if not ok:
             raise RuntimeError("Connected, but notify/control characteristics never appeared.")
 
         self._pick_characteristics()
-        print(f"[jc2] notify_path={self.notify_path}", file=sys.stderr)
-        print(f"[jc2] ctrl_path={self.ctrl_path}", file=sys.stderr)
+        if self.verbose:
+            self._dbg(f"[jc2][dbg] notify_path={self.notify_path}")
+            self._dbg(f"[jc2][dbg] ctrl_path={self.ctrl_path}")
 
     async def start(self):
-        """
-        One-time setup: attach PropertiesChanged handler once, cache notify/control interfaces,
-        then ensure notify is active + send optical init.
-        """
         ch_intro = await self.bus.introspect(BLUEZ, self.notify_path)
         ch_obj = self.bus.get_proxy_object(BLUEZ, self.notify_path, ch_intro)
         self._notify_ch = ch_obj.get_interface(GATT_CHRC_IFACE)
@@ -382,66 +371,69 @@ class JC2OpticalMouse:
         if self._notify_ch is None or self._ctrl_ch is None:
             raise RuntimeError("Driver not started yet (missing cached GATT interfaces).")
 
-        async def safe_start_notify():
-            try:
-                await self._notify_ch.call_start_notify()
-            except Exception as ex:
-                msg = str(ex)
-                if "In Progress" not in msg and "InProgress" not in msg:
-                    raise
-
-        async def safe_stop_notify():
-            try:
-                await self._notify_ch.call_stop_notify()
-            except Exception:
-                pass
-
-        async def write_cmd(hexstr: str):
-            b = bytes.fromhex(hexstr)
-            opts = {"type": Variant("s", "command")}
-            await self._ctrl_ch.call_write_value(b, opts)
-
-        async def send_optical_init():
-            await write_cmd("0c91010200040000ff000000")
-            await write_cmd("0c91010400040000ff000000")
-
-        # Try a few times; first-connect is flaky for optical enable.
-        attempts = [
-            (0.10, False),  # (delay, do_stop_notify)
-            (0.20, True),
-            (0.35, True),
-        ]
-
-        for i, (delay_s, do_cycle) in enumerate(attempts, 1):
-            print("[jc2] StartNotify()", file=sys.stderr)
-            if do_cycle:
-                await safe_stop_notify()
-                await asyncio.sleep(0.05)
-            await safe_start_notify()
-
-            await asyncio.sleep(delay_s)
-
-            print("[jc2] Sending optical init (FF)...", file=sys.stderr)
-            await send_optical_init()
-
-            # Wait for any notifications first (handler confirms we're receiving)
-            if not await self._wait_first_notification(timeout_s=1.0):
-                sys.stderr.write("[jc2] No notifications yet; will retry...\n")
-                sys.stderr.flush()
-                continue
-
-            # Now the real test: optical active (bytes 1..4 not all zero)
-            if await self._wait_optical_active(timeout_s=1.5):
-                print("[jc2] Optical stream active.", file=sys.stderr)
-                print("[jc2] Init sent. Moving cursor should work if notifications are correct.", file=sys.stderr)
-                return
-
-            sys.stderr.write(f"[jc2] Optical still inactive (attempt {i}); retrying...\n")
+        async with self._bringup_lock:
+            sys.stderr.write("[jc2] Enabling notifications + optical...\n")
             sys.stderr.flush()
 
-        # If we get here, we have notifications but optical never came up.
-        print("[jc2] Init sent, but optical still appears inactive (opt bytes are zero).", file=sys.stderr)
+            async def safe_start_notify():
+                try:
+                    await self._notify_ch.call_start_notify()
+                except Exception as ex:
+                    msg = str(ex)
+                    if "In Progress" not in msg and "InProgress" not in msg:
+                        raise
 
+            async def safe_stop_notify():
+                try:
+                    await self._notify_ch.call_stop_notify()
+                except Exception:
+                    pass
+
+            async def write_cmd(hexstr: str):
+                b = bytes.fromhex(hexstr)
+                opts = {"type": Variant("s", "command")}
+                await self._ctrl_ch.call_write_value(b, opts)
+
+            async def send_optical_init():
+                await write_cmd("0c91010200040000ff000000")
+                await write_cmd("0c91010400040000ff000000")
+
+            # first-connect optical enable can be flaky; these delays/cycles match what worked
+            attempts = [
+                (0.10, False),
+                (0.20, True),
+                (0.35, True),
+            ]
+
+            for i, (delay_s, do_cycle) in enumerate(attempts, 1):
+                if self.verbose:
+                    self._dbg(f"[jc2][dbg] bringup attempt {i} (cycle={do_cycle}, delay={delay_s:.2f}s)")
+
+                if do_cycle:
+                    await safe_stop_notify()
+                    await asyncio.sleep(0.05)
+
+                await safe_start_notify()
+                await asyncio.sleep(delay_s)
+                await send_optical_init()
+
+                # Ensure notifications are actually flowing
+                if not await self._wait_first_notification(timeout_s=1.0):
+                    if self.verbose:
+                        self._dbg("[jc2][dbg] no notifications yet; retrying...")
+                    continue
+
+                # Ensure optical bytes become non-zero
+                if await self._wait_optical_active(timeout_s=1.5):
+                    sys.stderr.write("[jc2] Optical stream active.\n")
+                    sys.stderr.flush()
+                    return
+
+                if self.verbose:
+                    self._dbg("[jc2][dbg] optical still inactive; retrying...")
+
+            sys.stderr.write("[jc2] Init sent, but optical still appears inactive (opt bytes are zero).\n")
+            sys.stderr.flush()
 
     def _update_stick(self, data: bytes, now: float) -> bool:
         if len(data) <= STICK_BASE_IDX + 2:
@@ -457,14 +449,12 @@ class JC2OpticalMouse:
         self._last_stick_x12 = x12
         self._last_stick_y12 = y12
 
-        # dt for rate-based scrolling
         if self._prev_notif_ts is None:
             dt = 0.0
         else:
             dt = now - self._prev_notif_ts
         self._prev_notif_ts = now
 
-        # Calibration: collect samples then set median center
         if self._stick_center_x12 is None or self._stick_center_y12 is None:
             self._stick_cal_x.append(x12)
             self._stick_cal_y.append(y12)
@@ -473,7 +463,6 @@ class JC2OpticalMouse:
                 self._stick_center_y12 = int(statistics.median(self._stick_cal_y))
             return False
 
-        # Gentle recenter when near neutral
         dx0 = x12 - self._stick_center_x12
         dy0 = y12 - self._stick_center_y12
         if abs(dx0) <= STICK_RECENTER_RADIUS and abs(dy0) <= STICK_RECENTER_RADIUS:
@@ -519,7 +508,6 @@ class JC2OpticalMouse:
         self._notif_count += 1
         self._last_notif_ts = now
 
-        # record button bytes (useful for status)
         if len(data) > 4:
             self._last_raw_b4 = data[4]
         if len(data) > 5:
@@ -527,11 +515,10 @@ class JC2OpticalMouse:
 
         did_any = False
 
-        # scroll can happen even if optical slice is missing
         if self._update_stick(data, now):
             did_any = True
 
-        # buttons (must work even if optical slice is missing)
+        # buttons (work even if optical slice missing)
         left = btn_pressed(data, BTN4, BTN_L)
         right = btn_pressed(data, BTN4, BTN_ZL)
         middle = btn_pressed(data, BTN5, BTN_R3)
@@ -551,7 +538,6 @@ class JC2OpticalMouse:
             self._prev_middle = middle
             did_any = True
 
-        # must have optical bytes to accumulate motion
         if len(data) < OPT_OFFSET + OPT_LEN:
             if did_any:
                 self.ui.syn()
@@ -599,7 +585,6 @@ class JC2OpticalMouse:
                 self._dx_accum += mdx
                 self._dy_accum += mdy
 
-        # only sync button/scroll writes here; motion is synced by the pump
         if did_any:
             self.ui.syn()
 
@@ -610,7 +595,6 @@ class JC2OpticalMouse:
         async def _pump():
             period = 1.0 / MOTION_HZ
 
-            # Drain behavior (Near perfect)
             DRAIN_FRACTION = 0.25
             MIN_PER_TICK = 1.0
             MAX_PER_TICK = float(MOTION_MAX_PER_TICK)
@@ -641,7 +625,6 @@ class JC2OpticalMouse:
                     ax = float(self._dx_accum)
                     ay = float(self._dy_accum)
 
-                # Spread backlog across multiple ticks (smooth)
                 mag = (ax * ax + ay * ay) ** 0.5
 
                 per_tick = mag * DRAIN_FRACTION
@@ -657,9 +640,6 @@ class JC2OpticalMouse:
                 ix = int(round(out_dx))
                 iy = int(round(out_dy))
 
-                self._last_emit_ix = ix
-                self._last_emit_iy = iy
-
                 if ix == 0 and iy == 0:
                     continue
 
@@ -667,7 +647,6 @@ class JC2OpticalMouse:
                 self.ui.write(e.EV_REL, e.REL_Y, iy)
                 self.ui.syn()
 
-                # subtract exactly what we emitted (integer residue handling)
                 self._dx_accum -= ix
                 self._dy_accum -= iy
 
@@ -683,36 +662,41 @@ async def run(mac: str, *, status: bool = True, status_hz: float = 5.0, verbose:
     last_print = 0.0
     last_count = 0
     last_restart = 0.0
+    last_rate_ts = time.time()
     period = 1.0 / max(0.5, float(status_hz))
 
     while True:
         await asyncio.sleep(0.2)
         now = time.time()
 
-        # watchdog: if no notifications for 2s, try to re-StartNotify + re-init
         age = (now - drv._last_notif_ts) if drv._last_notif_ts else 999.0
+
+        # Watchdog: total stall
         if age > 2.0 and (now - last_restart) > 3.0:
             last_restart = now
-            sys.stderr.write("\n[jc2] WARNING: notifications stalled; re-sending StartNotify + init...\n")
+            sys.stderr.write("\n[jc2] WARNING: notifications stalled; re-sending notify + optical init...\n")
             sys.stderr.flush()
             try:
                 await drv.ensure_notify_and_init()
             except Exception as ex:
-                sys.stderr.write(f"[jc2] restart failed: {ex}\n")
-                sys.stderr.flush()
+                if verbose:
+                    sys.stderr.write(f"[jc2][dbg] restart failed: {ex}\n")
+                    sys.stderr.flush()
 
-        # watchdog: notifications alive but optical inactive for too long -> re-init optical
+        # Watchdog: notifications alive but optical inactive
         if age < 0.5 and (now - drv._last_opt_active_ts) > 2.0:
+            if (now - drv._last_warn_ts) > 5.0:
+                drv._last_warn_ts = now
+                sys.stderr.write("\n[jc2] WARNING: optical inactive; re-sending notify + optical init...\n")
+                sys.stderr.flush()
             if (now - last_restart) > 3.0:
                 last_restart = now
-                sys.stderr.write("\n[jc2] WARNING: optical inactive; re-sending StartNotify + optical init...\n")
-                sys.stderr.flush()
                 try:
                     await drv.ensure_notify_and_init()
                 except Exception as ex:
-                    sys.stderr.write(f"[jc2] optical restart failed: {ex}\n")
-                    sys.stderr.flush()
-
+                    if verbose:
+                        sys.stderr.write(f"[jc2][dbg] optical restart failed: {ex}\n")
+                        sys.stderr.flush()
 
         if not status:
             continue
@@ -721,7 +705,9 @@ async def run(mac: str, *, status: bool = True, status_hz: float = 5.0, verbose:
             last_print = now
 
             cnt = drv._notif_count
-            rate = (cnt - last_count) / max(1e-6, (now - (last_print - period)))
+            dt_rate = now - last_rate_ts
+            last_rate_ts = now
+            rate = (cnt - last_count) / max(1e-6, dt_rate)
             last_count = cnt
 
             opt_age = (now - drv._last_opt_ts) if drv._last_opt_ts else 999.0
@@ -735,7 +721,6 @@ async def run(mac: str, *, status: bool = True, status_hz: float = 5.0, verbose:
             cx = drv._stick_center_x12
             cy = drv._stick_center_y12
 
-            # one-line status
             sys.stderr.write(
                 f"\r[jc2] notifs={cnt:6d} rate={rate:5.1f}/s age={age:4.1f}s "
                 f"opt_age={opt_age:4.1f}s b4=0x{b4:02x} b5=0x{b5:02x} "

@@ -4,13 +4,14 @@ import os
 import sys
 import subprocess
 import time
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List
 
 # Avoid root-owned __pycache__ + permission weirdness
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 
 from dbus_next.aio import MessageBus
 from dbus_next.constants import BusType
+
 from jc2mouse.driver import run as run_driver
 from jc2mouse.mapper import run_button_wizard
 
@@ -69,7 +70,6 @@ def _rssi_live(rssi: Optional[int]) -> bool:
         return False
     if rssi <= -999:
         return False
-    # reasonable bounds
     return -127 <= rssi <= 20
 
 
@@ -110,7 +110,6 @@ def _extract_device_candidate(objects: Dict[str, Any], path: str) -> Optional[Di
         return None
 
     rssi_v = _unwrap(dev.get("RSSI"))
-    rssi: Optional[int]
     try:
         rssi = int(rssi_v) if rssi_v is not None else None
     except Exception:
@@ -127,28 +126,39 @@ def _extract_device_candidate(objects: Dict[str, Any], path: str) -> Optional[Di
         "rssi": rssi,
         "mfg": mfg,
         "side": side,
-        "seen_ts": time.time(),  # refreshed whenever we re-extract it
+        "seen_ts": time.time(),
     }
+
+
+def _sort_key_pick(c: Dict[str, Any]) -> tuple:
+    """
+    Sort candidates by:
+      1) connected first (True > False)
+      2) live RSSI (higher is better; None/-999 treated low)
+      3) prefer right side (right > left > unknown)
+    """
+    rssi = c["rssi"]
+    rssi_score = rssi if _rssi_live(rssi) else -9999
+    side = c.get("side", "unknown")
+    side_score = 2 if side == "right" else 1 if side == "left" else 0
+    return (1 if c.get("connected") else 0, rssi_score, side_score)
 
 
 async def discover_jc2(
     timeout_s: float = 8.0,
     side_filter: str = "any",
     prefer_connected: bool = True,
-    ask: bool = False,
-) -> Dict[str, Any]:
+) -> tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
-    Returns a Joy-Con 2 candidate dict.
+    Returns: (picked, live_list, stale_list)
 
-    Selection priority:
-      1) If prefer_connected: any currently Connected Joy-Con 2 (filtered by side)
-      2) Otherwise: any "live" advertising Joy-Con 2 (valid RSSI) seen during scan window
-      3) Never auto-select stale cache (RSSI None/-999). If only stale exists -> error.
+    - prefer_connected=True: if any connected JC2 matches, pick it immediately
+    - otherwise scan for LIVE advertisers (valid RSSI) within timeout
+    - never auto-select stale cache (RSSI None/-999)
     """
     bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
     objects = await _get_managed_objects(bus)
 
-    # 1) Prefer already-connected devices
     all_now: List[Dict[str, Any]] = []
     for path in objects.keys():
         c = _extract_device_candidate(objects, path)
@@ -161,14 +171,9 @@ async def discover_jc2(
     if prefer_connected:
         connected_now = [c for c in all_now if c["connected"]]
         if connected_now:
-            # If multiple connected, pick best RSSI if any, else first.
-            connected_now.sort(key=lambda x: (x["rssi"] is not None, x["rssi"] or -999), reverse=True)
+            connected_now.sort(key=_sort_key_pick, reverse=True)
             pick = connected_now[0]
-            sys.stderr.write(
-                f"[jc2] Using already-connected device: {pick['mac']} (side={pick['side']})\n"
-            )
-            sys.stderr.flush()
-            return pick
+            return pick, [], []
 
     adapters = _find_adapters(objects)
     if not adapters:
@@ -179,7 +184,6 @@ async def discover_jc2(
     ad_obj = bus.get_proxy_object(BLUEZ, adapter_path, ad_intro)
     adapter = ad_obj.get_interface(ADAPTER_IFACE)
 
-    # 2) Scan for LIVE advertisers
     try:
         await adapter.call_start_discovery()
     except Exception as ex:
@@ -201,7 +205,6 @@ async def discover_jc2(
                 if side_filter in ("right", "left") and c["side"] != side_filter:
                     continue
 
-                # Track live vs stale based on RSSI
                 if _rssi_live(c["rssi"]):
                     prev = candidates_live.get(c["mac"])
                     if (prev is None) or ((c["rssi"] or -999) >= (prev["rssi"] or -999)):
@@ -219,70 +222,12 @@ async def discover_jc2(
         except Exception:
             pass
 
-    # Keep only live sightings that were “recent” within the scan window
     now = time.time()
     live = [c for c in candidates_live.values() if (now - c["seen_ts"]) < 2.0]
-    live.sort(key=lambda x: x.get("rssi", -999) or -999, reverse=True)
+    live.sort(key=_sort_key_pick, reverse=True)
 
-    sys.stderr.write("\n[jc2] Auto-discovery (LIVE advertisers):\n")
-    if not live:
-        sys.stderr.write("  (none)\n")
-    else:
-        for i, c in enumerate(live, 1):
-            sys.stderr.write(
-                f"  {i}) {c['mac']}  side={c['side']:<5}  rssi={c['rssi']:>4}  mfg={_format_bytes(c['mfg'])}\n"
-            )
-
-    # Show stale cache for debugging only
     stale = list(candidates_stale.values())
-    if stale:
-        sys.stderr.write("[jc2] Stale cache (ignored):\n")
-        for c in stale:
-            rssi_s = "None" if c["rssi"] is None else str(c["rssi"])
-            sys.stderr.write(
-                f"  -  {c['mac']}  side={c['side']:<5}  rssi={rssi_s:>4}  mfg={_format_bytes(c['mfg'])}\n"
-            )
-    sys.stderr.flush()
-
-    if not live:
-        raise RuntimeError(
-            "No LIVE Joy-Con 2 advertisers found.\n"
-            "Hold the pairing button so it advertises, then retry.\n"
-            "(Note: cached devices with RSSI -999 are ignored.)"
-        )
-
-    if len(live) == 1:
-        pick = live[0]
-        sys.stderr.write(f"[jc2] Selected: {pick['mac']} (side={pick['side']}, rssi={pick['rssi']})\n")
-        sys.stderr.flush()
-        return pick
-
-    if ask and sys.stdin.isatty():
-        while True:
-            try:
-                choice = input(f"Select device [1-{len(live)}] (or Enter = best RSSI): ").strip()
-            except EOFError:
-                choice = ""
-            if choice == "":
-                pick = live[0]
-                break
-            try:
-                idx = int(choice)
-                if 1 <= idx <= len(live):
-                    pick = live[idx - 1]
-                    break
-            except ValueError:
-                pass
-            print("Invalid choice.", file=sys.stderr)
-
-        sys.stderr.write(f"[jc2] Selected: {pick['mac']} (side={pick['side']}, rssi={pick['rssi']})\n")
-        sys.stderr.flush()
-        return pick
-
-    pick = live[0]
-    sys.stderr.write(f"[jc2] Selected best RSSI: {pick['mac']} (side={pick['side']}, rssi={pick['rssi']})\n")
-    sys.stderr.flush()
-    return pick
+    return (live[0] if live else {}), live, stale
 
 
 def main():
@@ -298,9 +243,9 @@ def main():
     p_run.add_argument("--auto", action="store_true", help="Auto-detect Joy-Con 2 and run it")
     p_run.add_argument("--side", choices=["any", "right", "left"], default="any", help="When using --auto, filter by side")
     p_run.add_argument("--timeout", type=float, default=8.0, help="Auto-discovery scan time seconds (default: 8)")
-    p_run.add_argument("--ask", action="store_true", help="When multiple devices match, ask which to use")
-    p_run.add_argument("--prefer-connected", action="store_true", help="Prefer already-connected Joy-Con 2 (default)")
-    p_run.add_argument("--no-prefer-connected", action="store_true", help="Do not prefer already-connected device")
+    p_run.add_argument("--ask", action="store_true", help="If multiple LIVE devices match, ask which to use")
+    p_run.add_argument("--no-prefer-connected", action="store_true", help="When using --auto, do NOT prefer already-connected device")
+    p_run.add_argument("--print-mfg", action="store_true", help="Print manufacturer hex in listings (developer)")
     p_run.add_argument("--no-status", action="store_true", help="Disable the one-line status output")
     p_run.add_argument("--status-hz", type=float, default=5.0, help="Status refresh rate (default: 5 Hz)")
     p_run.add_argument("--verbose", action="store_true", help="Developer verbosity (rarely needed)")
@@ -308,6 +253,7 @@ def main():
     p_scan = sub.add_parser("scan", help="Scan and list LIVE Joy-Con 2 candidates (no connect)")
     p_scan.add_argument("--side", choices=["any", "right", "left"], default="any", help="Filter by side")
     p_scan.add_argument("--timeout", type=float, default=8.0, help="Scan time seconds (default: 8)")
+    p_scan.add_argument("--print-mfg", action="store_true", help="Print manufacturer hex (developer)")
 
     p_map = sub.add_parser("dev-map-buttons", help="Developer: interactively discover button bit/byte positions")
     p_map.add_argument("--mac", required=True, help="Joy-Con 2 MAC address")
@@ -329,12 +275,34 @@ def main():
         async def _do_scan():
             sys.stderr.write("[jc2] Hold Joy-Con 2 pairing button now...\n")
             sys.stderr.flush()
-            await discover_jc2(
+
+            pick, live, stale = await discover_jc2(
                 timeout_s=args.timeout,
                 side_filter=args.side,
-                prefer_connected=False,  # scan is scan
-                ask=False,
+                prefer_connected=False,
             )
+
+            sys.stderr.write("\n[jc2] Auto-discovery (LIVE advertisers):\n")
+            if not live:
+                sys.stderr.write("  (none)\n")
+            else:
+                for i, c in enumerate(live, 1):
+                    mfg_s = f"  mfg={_format_bytes(c['mfg'])}" if args.print_mfg else ""
+                    sys.stderr.write(
+                        f"  {i}) {c['mac']}  side={c['side']:<5}  rssi={c['rssi']:>4}{mfg_s}\n"
+                    )
+
+            if stale and args.print_mfg:
+                sys.stderr.write("[jc2] Stale cache (ignored):\n")
+                for c in stale:
+                    rssi_s = "None" if c["rssi"] is None else str(c["rssi"])
+                    sys.stderr.write(
+                        f"  -  {c['mac']}  side={c['side']:<5}  rssi={rssi_s:>4}  mfg={_format_bytes(c['mfg'])}\n"
+                    )
+            sys.stderr.flush()
+
+            if not live:
+                raise RuntimeError("No LIVE Joy-Con 2 advertisers found.")
 
         try:
             asyncio.run(_do_scan())
@@ -347,26 +315,49 @@ def main():
             mac = args.mac
 
             if args.auto:
-                prefer = True
-                if args.no_prefer_connected:
-                    prefer = False
-                if not args.prefer_connected and not args.no_prefer_connected:
-                    prefer = True  # default
+                prefer_connected = not args.no_prefer_connected
 
-                if prefer:
-                    sys.stderr.write("[jc2] (auto) Will use already-connected Joy-Con 2 if found.\n")
-                sys.stderr.write("[jc2] If not connected, hold Joy-Con 2 pairing button now...\n")
+                sys.stderr.write("[jc2] Auto mode: hold pairing button if not already connected.\n")
+                sys.stderr.write("[jc2] Tip: use --ask if multiple Joy-Con 2 are advertising.\n")
                 sys.stderr.flush()
 
-                pick = await discover_jc2(
+                pick, live, stale = await discover_jc2(
                     timeout_s=args.timeout,
                     side_filter=args.side,
-                    prefer_connected=prefer,
-                    ask=args.ask,
+                    prefer_connected=prefer_connected,
                 )
-                mac = pick["mac"]
-                sys.stderr.write(f"[jc2] Auto-selected {mac} (side={pick['side']}, rssi={pick['rssi']})\n")
-                sys.stderr.flush()
+
+                if pick:
+                    mac = pick["mac"]
+                    sys.stderr.write(f"[jc2] Auto-selected {mac} (side={pick['side']}, rssi={pick.get('rssi')})\n")
+                    sys.stderr.flush()
+
+                    # Only print listings if we actually scanned and found multiple
+                    if live and len(live) > 1:
+                        sys.stderr.write("\n[jc2] LIVE advertisers:\n")
+                        for i, c in enumerate(live, 1):
+                            mfg_s = f"  mfg={_format_bytes(c['mfg'])}" if args.print_mfg else ""
+                            sys.stderr.write(
+                                f"  {i}) {c['mac']}  side={c['side']:<5}  rssi={c['rssi']:>4}{mfg_s}\n"
+                            )
+                        sys.stderr.flush()
+
+                    # Optional interactive pick
+                    if args.ask and live and len(live) > 1 and sys.stdin.isatty():
+                        while True:
+                            choice = input(f"Select device [1-{len(live)}] (Enter=best): ").strip()
+                            if choice == "":
+                                break
+                            try:
+                                idx = int(choice)
+                                if 1 <= idx <= len(live):
+                                    mac = live[idx - 1]["mac"]
+                                    sys.stderr.write(f"[jc2] Selected {mac}\n")
+                                    sys.stderr.flush()
+                                    break
+                            except ValueError:
+                                pass
+                            print("Invalid choice.", file=sys.stderr)
 
             if not mac:
                 raise SystemExit("ERROR: provide --mac or use --auto")

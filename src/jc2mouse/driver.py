@@ -16,11 +16,11 @@ PROP_IFACE = "org.freedesktop.DBus.Properties"
 DEVICE_IFACE = "org.bluez.Device1"
 GATT_CHRC_IFACE = "org.bluez.GattCharacteristic1"
 
-# ---- Joy-Con 2 known GATT UUIDs (from your discovery logs) ----
+# ---- Joy-Con 2 known GATT UUIDs ----
 DEFAULT_NOTIFY_UUID = "ab7de9be-89fe-49ad-828f-118f09df7fd2"
 DEFAULT_CTRL_UUID = "649d4ac9-8eb7-4e6c-af44-1ea54fe5f005"
 
-# ---- Optical decode (your proven logic) ----
+# ---- Optical decode ----
 OPT_OFFSET = 0x0F
 OPT_LEN = 5
 X_LO_IDX, X_HI_IDX = 1, 2
@@ -35,7 +35,6 @@ INVERT_X = False
 INVERT_Y = False
 
 # ---- Motion smoothing / resample ----
-# (These are the "perfect" settings you ended up with)
 MOTION_HZ = 120.0
 MOTION_MAX_PER_TICK = 60  # 60*120 = 7200/sec throughput
 MOTION_IDLE_CUTOFF_S = 0.060  # if no motion for 60ms, start braking
@@ -56,7 +55,7 @@ SCROLL_CURVE_POWER = 1.6
 SCROLL_MAX_STEP = 3
 
 
-# ---- Button bitfields (current best map) ----
+# ---- Button bitfields ----
 BTN4 = 4
 BTN5 = 5
 
@@ -474,7 +473,7 @@ class JC2OpticalMouse:
                 self._stick_center_y12 = int(statistics.median(self._stick_cal_y))
             return False
 
-        # Optional gentle recenter when near neutral
+        # Gentle recenter when near neutral
         dx0 = x12 - self._stick_center_x12
         dy0 = y12 - self._stick_center_y12
         if abs(dx0) <= STICK_RECENTER_RADIUS and abs(dy0) <= STICK_RECENTER_RADIUS:
@@ -611,7 +610,7 @@ class JC2OpticalMouse:
         async def _pump():
             period = 1.0 / MOTION_HZ
 
-            # Drain behavior (this is the part that made it feel PERFECT)
+            # Drain behavior (Near perfect)
             DRAIN_FRACTION = 0.25
             MIN_PER_TICK = 1.0
             MAX_PER_TICK = float(MOTION_MAX_PER_TICK)
@@ -736,7 +735,7 @@ async def run(mac: str, *, status: bool = True, status_hz: float = 5.0, verbose:
             cx = drv._stick_center_x12
             cy = drv._stick_center_y12
 
-            # concise one-line status (won't scroll unless your terminal wraps due to width)
+            # one-line status
             sys.stderr.write(
                 f"\r[jc2] notifs={cnt:6d} rate={rate:5.1f}/s age={age:4.1f}s "
                 f"opt_age={opt_age:4.1f}s b4=0x{b4:02x} b5=0x{b5:02x} "

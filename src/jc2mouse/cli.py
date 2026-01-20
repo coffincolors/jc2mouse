@@ -4,13 +4,14 @@ import os
 import sys
 import subprocess
 import time
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 # Avoid root-owned __pycache__ + permission weirdness
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 
 from dbus_next.aio import MessageBus
 from dbus_next.constants import BusType
+from dbus_next.errors import DBusError
 
 from jc2mouse.driver import run as run_driver
 from jc2mouse.mapper import run_button_wizard
@@ -19,6 +20,7 @@ BLUEZ = "org.bluez"
 OM_IFACE = "org.freedesktop.DBus.ObjectManager"
 ADAPTER_IFACE = "org.bluez.Adapter1"
 DEVICE_IFACE = "org.bluez.Device1"
+PROP_IFACE = "org.freedesktop.DBus.Properties"
 
 # Manufacturer / Joy-Con 2 signature (observed stable pattern)
 NINTENDO_COMPANY_ID = 0x0553
@@ -28,15 +30,52 @@ JC2_SIDE_BYTE_IDX = 5  # 0-based in mfg payload
 JC2_SIDE_RIGHT = 0x66
 JC2_SIDE_LEFT = 0x67
 
+# Session services (see scripts/jc2-session.sh)
+STOCK_BT_SERVICE = "bluetooth.service"
+JC2_BT_SERVICE = "jc2-bluetooth.service"
+
 
 def _require_root():
     if os.geteuid() != 0:
-        print("ERROR: must run as root (sudo) for uinput + bluetooth session control", file=sys.stderr)
+        print("ERROR: must run as root (sudo) for uinput + session control", file=sys.stderr)
         raise SystemExit(1)
 
 
 def _call_session(cmd: str):
     subprocess.check_call(["/usr/local/sbin/jc2-session", cmd])
+
+
+def _service_is_active(unit: str) -> bool:
+    # returns 0 if active
+    r = subprocess.run(["systemctl", "is-active", "--quiet", unit])
+    return r.returncode == 0
+
+def _service_is_masked(unit: str) -> bool:
+    p = subprocess.run(["systemctl", "is-enabled", unit], capture_output=True, text=True)
+    return "masked" in (p.stdout + p.stderr)
+
+
+def _ensure_session(mode: str) -> bool:
+    """
+    Returns True if we started session mode ourselves and should stop it on exit.
+    mode:
+      - auto: start jc2 session only if not already active
+      - on:   always start jc2 session and leave it running
+      - off:  do not touch services
+    """
+    if mode == "off":
+        return False
+
+    already = _service_is_active(JC2_BT_SERVICE)
+    if mode == "auto":
+        if already:
+            return False
+        _call_session("start")
+        return True
+
+    # mode == "on"
+    _call_session("start")
+    return False  # leave it on
 
 
 def _unwrap(v):
@@ -148,7 +187,7 @@ async def discover_jc2(
     timeout_s: float = 8.0,
     side_filter: str = "any",
     prefer_connected: bool = True,
-) -> tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Returns: (picked, live_list, stale_list)
 
@@ -184,10 +223,36 @@ async def discover_jc2(
     ad_obj = bus.get_proxy_object(BLUEZ, adapter_path, ad_intro)
     adapter = ad_obj.get_interface(ADAPTER_IFACE)
 
+    # After restarting bluetoothd (session mode), BlueZ may need a moment before discovery works.
+    # Also ensure adapter is Powered=True.
+    props_intro = await bus.introspect(BLUEZ, adapter_path)
+    props_obj = bus.get_proxy_object(BLUEZ, adapter_path, props_intro)
+    props = props_obj.get_interface("org.freedesktop.DBus.Properties")
+
+    # Best-effort power on
     try:
-        await adapter.call_start_discovery()
-    except Exception as ex:
-        raise RuntimeError(f"StartDiscovery failed: {ex}")
+        await props.call_set(ADAPTER_IFACE, "Powered", __import__("dbus_next").Variant("b", True))
+    except Exception:
+        pass
+
+    last_ex = None
+    for attempt in range(1, 8):  # ~ (0.2+0.3+...+0.8) seconds total
+        try:
+            await adapter.call_start_discovery()
+            last_ex = None
+            break
+        except Exception as ex:
+            last_ex = ex
+            msg = str(ex)
+            # Common right after service restart
+            if "Resource Not Ready" in msg or "In Progress" in msg:
+                await asyncio.sleep(min(0.15 + attempt * 0.10, 0.8))
+                continue
+            raise RuntimeError(f"StartDiscovery failed: {ex}")
+
+    if last_ex is not None:
+        raise RuntimeError(f"StartDiscovery failed: {last_ex}")
+
 
     candidates_live: Dict[str, Dict[str, Any]] = {}
     candidates_stale: Dict[str, Dict[str, Any]] = {}
@@ -230,6 +295,50 @@ async def discover_jc2(
     return (live[0] if live else {}), live, stale
 
 
+async def _disconnect_device_by_mac(mac: str) -> bool:
+    """
+    Best-effort disconnect using BlueZ Device1.Disconnect.
+    Returns True if we found the device and issued Disconnect.
+    """
+    mac = mac.upper()
+    bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    objects = await _get_managed_objects(bus)
+
+    dev_path = None
+    suffix = "dev_" + mac.replace(":", "_")
+    for path, ifaces in objects.items():
+        if path.endswith(suffix) and DEVICE_IFACE in ifaces:
+            dev_path = path
+            break
+    if not dev_path:
+        return False
+
+    intro = await bus.introspect(BLUEZ, dev_path)
+    obj = bus.get_proxy_object(BLUEZ, dev_path, intro)
+    dev = obj.get_interface(DEVICE_IFACE)
+
+    try:
+        await dev.call_disconnect()
+        return True
+    except Exception:
+        return True
+
+
+def _friendly_connect_error(ex: Exception) -> str:
+    s = str(ex)
+    # You saw: dbus_next.errors.DBusError: le-connection-abort-by-local
+    if "le-connection-abort-by-local" in s:
+        return (
+            "Bluetooth LE connection was aborted locally.\n"
+            "Most commonly this happens if the Joy-Con wasn’t in the right state.\n\n"
+            "Try this:\n"
+            "  1) Hold the small PAIR button on the rail until you see “Connected”.\n"
+            "  2) Do NOT press other buttons while it’s connecting.\n"
+            "  3) If it keeps happening, tap PAIR once, wait 2s, then run again.\n"
+        )
+    return s
+
+
 def main():
     ap = argparse.ArgumentParser(prog="jc2mouse")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -238,17 +347,33 @@ def main():
     sub.add_parser("start", help="Enter jc2 session mode (stop stock bluetooth, start patched bluetoothd)")
     sub.add_parser("stop", help="Exit jc2 session mode (stop patched bluetoothd, restore stock bluetooth)")
 
-    p_run = sub.add_parser("run", help="Run optical mouse driver (requires session mode active)")
+    p_run = sub.add_parser("run", help="Run Joy-Con 2 driver")
     p_run.add_argument("--mac", help="Joy-Con 2 MAC address (e.g. 98:E2:55:DF:56:13)")
     p_run.add_argument("--auto", action="store_true", help="Auto-detect Joy-Con 2 and run it")
-    p_run.add_argument("--side", choices=["any", "right", "left"], default="any", help="When using --auto, filter by side")
+    p_run.add_argument("--side", choices=["any", "right", "left"], default="any",
+                       help="When using --auto, filter by side")
     p_run.add_argument("--timeout", type=float, default=8.0, help="Auto-discovery scan time seconds (default: 8)")
     p_run.add_argument("--ask", action="store_true", help="If multiple LIVE devices match, ask which to use")
-    p_run.add_argument("--no-prefer-connected", action="store_true", help="When using --auto, do NOT prefer already-connected device")
+    p_run.add_argument("--no-prefer-connected", action="store_true",
+                       help="When using --auto, do NOT prefer already-connected device")
     p_run.add_argument("--print-mfg", action="store_true", help="Print manufacturer hex in listings (developer)")
     p_run.add_argument("--no-status", action="store_true", help="Disable the one-line status output")
     p_run.add_argument("--status-hz", type=float, default=5.0, help="Status refresh rate (default: 5 Hz)")
     p_run.add_argument("--verbose", action="store_true", help="Developer verbosity (rarely needed)")
+
+    # QoL / lifecycle
+    p_run.add_argument("--session", choices=["auto", "on", "off"], default="auto",
+                       help="Session mode handling: auto=start jc2 session if needed (default), on=force start, off=do nothing")
+    p_run.add_argument("--leave-session", action="store_true",
+                       help="When --session auto starts the session, do NOT stop it on exit")
+    p_run.add_argument("--disconnect-on-exit", action="store_true", default=True,
+                       help="Best-effort disconnect Joy-Con on exit (default: on)")
+    p_run.add_argument("--no-disconnect-on-exit", dest="disconnect_on_exit", action="store_false",
+                       help="Do NOT disconnect Joy-Con on exit")
+
+    # Roadmap: combined mode (stub for now)
+    p_run.add_argument("--combined", action="store_true",
+                       help="(WIP) Combined full-controller mode using both Joy-Cons (not implemented yet)")
 
     p_scan = sub.add_parser("scan", help="Scan and list LIVE Joy-Con 2 candidates (no connect)")
     p_scan.add_argument("--side", choices=["any", "right", "left"], default="any", help="Filter by side")
@@ -311,14 +436,30 @@ def main():
         return 0
 
     if args.cmd == "run":
+        started_session = False
+        chosen_mac: Optional[str] = None
+        chosen_side: str = "unknown"
+
         async def _do_run():
+            nonlocal started_session, chosen_mac, chosen_side
+
+            if args.combined:
+                raise SystemExit("ERROR: --combined is not implemented yet (next milestone).")
+
+            # session handling
+            try:
+                started_session = _ensure_session(args.session)
+            except Exception as ex:
+                raise SystemExit(f"ERROR: failed to enter session mode: {ex}")
+
             mac = args.mac
 
             if args.auto:
                 prefer_connected = not args.no_prefer_connected
 
-                sys.stderr.write("[jc2] Auto mode: hold pairing button if not already connected.\n")
+                sys.stderr.write("[jc2] Auto mode: hold the PAIR button if not already connected.\n")
                 sys.stderr.write("[jc2] Tip: use --ask if multiple Joy-Con 2 are advertising.\n")
+                sys.stderr.write("[jc2] Tip: avoid pressing other buttons while it’s connecting.\n")
                 sys.stderr.flush()
 
                 pick, live, stale = await discover_jc2(
@@ -329,7 +470,16 @@ def main():
 
                 if pick:
                     mac = pick["mac"]
-                    sys.stderr.write(f"[jc2] Auto-selected {mac} (side={pick['side']}, rssi={pick.get('rssi')})\n")
+                    chosen_side = pick.get("side", "unknown")
+                    sys.stderr.write(f"[jc2] Auto-selected {mac} (side={chosen_side}, rssi={pick.get('rssi')})\n")
+                    sys.stderr.flush()
+
+                    if chosen_side == "left":
+                        sys.stderr.write("[jc2] Left Joy-Con tip: hold L+ZL to toggle mouse/gamepad.\n")
+                    elif chosen_side == "right":
+                        sys.stderr.write("[jc2] Right Joy-Con tip: press C to toggle mouse/gamepad.\n")
+                    else:
+                        sys.stderr.write("[jc2] Tip: Right uses C; Left uses hold L+ZL to toggle.\n")
                     sys.stderr.flush()
 
                     # Only print listings if we actually scanned and found multiple
@@ -352,7 +502,8 @@ def main():
                                 idx = int(choice)
                                 if 1 <= idx <= len(live):
                                     mac = live[idx - 1]["mac"]
-                                    sys.stderr.write(f"[jc2] Selected {mac}\n")
+                                    chosen_side = live[idx - 1].get("side", "unknown")
+                                    sys.stderr.write(f"[jc2] Selected {mac} (side={chosen_side})\n")
                                     sys.stderr.flush()
                                     break
                             except ValueError:
@@ -362,17 +513,52 @@ def main():
             if not mac:
                 raise SystemExit("ERROR: provide --mac or use --auto")
 
-            await run_driver(
-                mac,
-                status=(not args.no_status),
-                status_hz=args.status_hz,
-                verbose=args.verbose,
-            )
+            chosen_mac = mac
+
+            try:
+                await run_driver(
+                    mac,
+                    status=(not args.no_status),
+                    status_hz=args.status_hz,
+                    verbose=args.verbose,
+                )
+            except DBusError as ex:
+                msg = _friendly_connect_error(ex)
+                raise SystemExit(f"ERROR: {msg}")
+            except Exception as ex:
+                raise SystemExit(f"ERROR: {ex}")
 
         try:
             asyncio.run(_do_run())
         except KeyboardInterrupt:
             print("\n[jc2] Stopped.", file=sys.stderr)
+        finally:
+            # Best-effort disconnect (so the Joy-Con doesn’t stay connected after exit)
+            if args.disconnect_on_exit and chosen_mac:
+                try:
+                    asyncio.run(_disconnect_device_by_mac(chosen_mac))
+                except Exception:
+                    pass
+
+            # Stop session if we started it (unless user asked to leave it)
+            if started_session and (not args.leave_session):
+                # If stock bluetooth is masked, stopping session would leave the system with no bluetoothd.
+                if _service_is_masked("bluetooth.service"):
+                    print(
+                        "\n[jc2] NOTE: bluetooth.service is masked; leaving jc2 session active "
+                        "(otherwise there would be no bluetooth daemon running).",
+                        file=sys.stderr
+                    )
+                    print("[jc2] To restore normal bluetooth later:", file=sys.stderr)
+                    print("      sudo systemctl unmask bluetooth.service", file=sys.stderr)
+                    print("      sudo systemctl enable --now bluetooth.service", file=sys.stderr)
+                else:
+                    try:
+                        _call_session("stop")
+                    except Exception:
+                        pass
+
+
         return 0
 
     if args.cmd == "dev-map-buttons":

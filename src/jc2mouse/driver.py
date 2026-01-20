@@ -14,12 +14,61 @@ try:
 except Exception:
     from evdev.device import AbsInfo  # fallback
 
+import inspect
+import importlib.metadata as _ilmd
+
+
+def _uinput_ctor_kwargs_supported() -> set[str]:
+    """Return the accepted kwarg names for evdev.UInput.__init__()."""
+    try:
+        return set(inspect.signature(UInput.__init__).parameters.keys())
+    except Exception:
+        # If signature inspection fails, assume the common documented kwargs.
+        return {"events", "name", "vendor", "product", "version", "bustype", "devnode", "phys", "input_props", "max_effects"}
+
+
+def mk_uinput(caps: dict, *, verbose: bool = False, **kwargs):
+    """
+    Create a UInput device while safely passing only kwargs supported by this evdev build.
+    This prevents identity kwargs from being dropped just because one unsupported kwarg was included.
+    """
+    supported = _uinput_ctor_kwargs_supported()
+
+    # UInput's first positional arg is commonly 'events' (or 'events=None'); we pass caps positionally.
+    filtered = {k: v for k, v in kwargs.items() if k in supported}
+
+    if verbose:
+        dropped = sorted(set(kwargs.keys()) - set(filtered.keys()))
+        try:
+            ver = _ilmd.version("evdev")
+        except Exception:
+            ver = "unknown"
+        _stderr(f"[jc2][dbg] evdev={ver} UInput kwargs supported={sorted(supported)} dropped={dropped}")
+
+    return UInput(caps, **filtered)
+
+
 
 BLUEZ = "org.bluez"
 OM_IFACE = "org.freedesktop.DBus.ObjectManager"
 PROP_IFACE = "org.freedesktop.DBus.Properties"
 DEVICE_IFACE = "org.bluez.Device1"
 GATT_CHRC_IFACE = "org.bluez.GattCharacteristic1"
+
+# ---- Joy-Con 2 identification + side detection via ManufacturerData ----
+NINTENDO_COMPANY_ID = 0x0553
+JC2_MFG_LEN = 24
+JC2_MFG_PREFIX = bytes.fromhex("01 00 03 7e 05")
+JC2_SIDE_BYTE_IDX = 5
+JC2_SIDE_RIGHT = 0x66
+JC2_SIDE_LEFT = 0x67
+
+# Button byte indices differ between Right vs Left JC2 packets
+RIGHT_BTN_FACE_IDX = 4   # ABXY/SR/SL/L/ZL live here on Right
+RIGHT_BTN_MISC_IDX = 5   # PLUS/R3/HOME/C live here on Right
+
+LEFT_BTN_MISC_IDX = 5    # MINUS/L3/CAPTURE live here on Left
+LEFT_BTN_FACE_IDX = 6    # DPAD/SL/SR/L/ZL live here on Left
 
 # ---- Joy-Con 2 known GATT UUIDs ----
 DEFAULT_NOTIFY_UUID = "ab7de9be-89fe-49ad-828f-118f09df7fd2"
@@ -46,8 +95,11 @@ MOTION_IDLE_CUTOFF_S = 0.060  # if no motion for 60ms, start braking
 MOTION_IDLE_BRAKE = 0.35  # keep 35% of backlog each tick when idle
 MOTION_IDLE_ZERO = 1.0  # if backlog smaller than this, zero it
 
-# ---- Stick location (bytes 13-15 = 3 bytes packed for X/Y 12-bit) ----
-STICK_BASE_IDX = 13  # data[13], data[14], data[15]
+# ---- Stick location (3 bytes packed for X/Y 12-bit) ----
+# Right JC2: stick bytes at data[13:16]
+# Left  JC2: stick bytes at data[10:13] (see your capture: ... e0 ff 0f 44 38 85 ff f7 7f ...)
+STICK_BASE_RIGHT = 13
+STICK_BASE_LEFT  = 10
 
 # Stick calibration
 STICK_CAL_SAMPLES = 25
@@ -79,6 +131,35 @@ BTN_PLUS = 0x02
 BTN_R3 = 0x04
 BTN_HOME = 0x10
 BTN_C = 0x40
+
+# ---- Left Joy-Con 2 button layout (from gatttool captures) ----
+# Left uses different byte indices than Right:
+#   Right: face=4 (ABXY...), misc=5 (+, home, C, R3)
+#   Left : misc=5 (minus, L3, capture), face=6 (dpad, SL/SR, L/ZL)
+RIGHT_BTN_FACE_IDX = 4
+RIGHT_BTN_MISC_IDX = 5
+
+LEFT_BTN_MISC_IDX = 5
+LEFT_BTN_FACE_IDX = 6
+
+# Left misc byte (index 5)
+LBTN_MINUS   = 0x01
+LBTN_L3      = 0x08
+LBTN_CAPTURE = 0x20
+
+# Left face byte (index 6)
+LBTN_DDOWN  = 0x01
+LBTN_DUP    = 0x02
+LBTN_DRIGHT = 0x04
+LBTN_DLEFT  = 0x08
+LBTN_SR     = 0x10
+LBTN_SL     = 0x20
+LBTN_L      = 0x40
+LBTN_ZL     = 0x80
+
+# Left mode toggle: hold L+ZL (seconds)
+LEFT_MODE_TOGGLE_HOLD_S = 1.2
+
 
 
 def _unwrap(v):
@@ -132,6 +213,20 @@ class JC2OpticalMouse:
         self.ctrl_uuid = (ctrl_uuid or DEFAULT_CTRL_UUID).lower()
         self.verbose = verbose
 
+        # Device side: "right" / "left" / "unknown"
+        self.side = "unknown"
+        self._btn_face_idx = RIGHT_BTN_FACE_IDX
+        self._btn_misc_idx = RIGHT_BTN_MISC_IDX
+        self._stick_base_idx = STICK_BASE_RIGHT  # default until we detect side
+
+
+        # Left has no C button; use L+ZL hold for mode toggle
+        self._left_hold_start = 0.0
+        self._left_hold_latched = False
+
+        self._left_toggle_hold_active = False
+
+
         # mode: "mouse" or "gamepad"
         self.mode = "mouse"
         self._prev_mode_btn = False
@@ -163,6 +258,10 @@ class JC2OpticalMouse:
         # scroll accumulator + timing (mouse mode)
         self._wheel_accum = 0.0
         self._prev_notif_ts: float | None = None
+
+        # last inter-notification dt (used for scroll rate normalization)
+        self._last_notif_dt = 1.0 / 40.0
+
 
         self.bus: MessageBus | None = None
         self.objects = None
@@ -207,6 +306,10 @@ class JC2OpticalMouse:
             "start": False,
             "mode": False,
             "thumb": False,
+            "dup": False,
+            "ddown": False,
+            "dleft": False,
+            "dright": False,
         }
 
         # cached GATT interfaces for restart logic
@@ -218,9 +321,23 @@ class JC2OpticalMouse:
         self._dev = None
         self._dev_props = None
 
+        # ---- Virtual input devices (uinput) ----
+        #
+        # IMPORTANT:
+        # If we do not explicitly set bustype/vendor/product/version, python-evdev/uinput commonly
+        # defaults to Vendor=0x0001 Product=0x0001. Steam can then match the device GUID to an
+        # existing virtual-gamepad profile (often seen as "MoltenGamepad") and apply its own
+        # remapping (e.g. X/Y swapped only inside Steam).
+        #
+        # So: give jc2mouse a unique identity that won't collide with anyone else's uinput device.
 
-        # Mouse uinput
-        self.ui_mouse = UInput(
+        UINPUT_BUSTYPE = getattr(e, "BUS_VIRTUAL", 0x06)
+        UINPUT_VENDOR  = 0x045E
+        UINPUT_VERSION = 0x0001
+        UINPUT_PRODUCT_MOUSE = 0x4A31
+        UINPUT_PRODUCT_PAD   = 0x028E
+
+        self.ui_mouse = mk_uinput(
             {
                 e.EV_REL: [
                     e.REL_X,
@@ -231,31 +348,37 @@ class JC2OpticalMouse:
                 e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE],
             },
             name="jc2mouse (mouse)",
+            bustype=UINPUT_BUSTYPE,
+            vendor=UINPUT_VENDOR,
+            product=UINPUT_PRODUCT_MOUSE,
+            version=UINPUT_VERSION,
+            phys=f"jc2mouse/{self.mac}/mouse",
+            # NOTE: DO NOT pass uniq here; UInput doesn't accept it in python-evdev.
+            verbose=self.verbose,
         )
 
-        # Gamepad uinput (Xbox-ish)
-        self.ui_pad = UInput(
+        self.ui_pad = mk_uinput(
             {
                 e.EV_KEY: [
-                    e.BTN_SOUTH,  # A
-                    e.BTN_EAST,   # B
-                    e.BTN_NORTH,  # X
-                    e.BTN_WEST,   # Y
-                    e.BTN_TL,     # LB
-                    e.BTN_TR,     # RB
-                    e.BTN_SELECT, # Back
-                    e.BTN_START,  # Start
-                    e.BTN_MODE,   # Guide
-                    e.BTN_THUMBL, # L3
+                    e.BTN_SOUTH, e.BTN_EAST, e.BTN_NORTH, e.BTN_WEST,
+                    e.BTN_TL, e.BTN_TR,
+                    e.BTN_SELECT, e.BTN_START, e.BTN_MODE, e.BTN_THUMBL,
+                    e.BTN_DPAD_UP, e.BTN_DPAD_DOWN, e.BTN_DPAD_LEFT, e.BTN_DPAD_RIGHT,
                 ],
-                # IMPORTANT: for older evdev, ABS axes must be (code, AbsInfo(...)) tuples
                 e.EV_ABS: [
                     (e.ABS_X, AbsInfo(32768, 0, 65535, 0, 512, 0)),
                     (e.ABS_Y, AbsInfo(32768, 0, 65535, 0, 512, 0)),
                 ],
             },
             name="jc2mouse (gamepad)",
+            bustype=UINPUT_BUSTYPE,
+            vendor=UINPUT_VENDOR,
+            product=UINPUT_PRODUCT_PAD,
+            version=UINPUT_VERSION,
+            phys=f"jc2mouse/{self.mac}/pad",
+            verbose=self.verbose,
         )
+
 
 
     async def _get_managed_objects(self):
@@ -376,6 +499,10 @@ class JC2OpticalMouse:
         dev = dev_obj.get_interface(DEVICE_IFACE)
         props = dev_obj.get_interface(PROP_IFACE)
 
+        await self._detect_and_configure_side(props)
+        if self.verbose:
+            _stderr(f"[jc2][dbg] detected side={self.side} face_idx={self._btn_face_idx} misc_idx={self._btn_misc_idx}")
+
         self._dev = dev
         self._dev_props = props
 
@@ -458,53 +585,53 @@ class JC2OpticalMouse:
 
         # handler is already installed; no need to re-install
 
-    async def ensure_notify_and_init(self):
+    async def ensure_notify_and_init(self) -> None:
+        """
+        Bring up notifications + send optical init.
+        IMPORTANT: Do NOT treat opt bytes all-zero as a hard failure, because optical can be enabled
+        while stationary and still report 00 00 00 00 deltas. We only require that notifications
+        are flowing and init is sent; watchdog can retry later if motion never appears.
+        """
         if self._notify_ch is None or self._ctrl_ch is None:
             raise RuntimeError("Driver not started yet (missing cached GATT interfaces).")
 
-        async def _call_with_timeout(coro, timeout_s: float, label: str):
-            try:
-                return await asyncio.wait_for(coro, timeout=timeout_s)
-            except asyncio.TimeoutError:
-                raise RuntimeError(f"Timed out: {label}")
-
         async def safe_start_notify():
             try:
-                await _call_with_timeout(self._notify_ch.call_start_notify(), 2.5, "StartNotify")
+                await self._notify_ch.call_start_notify()
             except Exception as ex:
                 msg = str(ex)
-                # BlueZ sometimes reports this while enabling; treat as non-fatal.
+                # BlueZ often reports "In Progress" while enabling
                 if "In Progress" not in msg and "InProgress" not in msg:
                     raise
 
         async def safe_stop_notify():
             try:
-                await _call_with_timeout(self._notify_ch.call_stop_notify(), 2.0, "StopNotify")
+                await self._notify_ch.call_stop_notify()
             except Exception:
                 pass
 
         async def write_cmd(hexstr: str):
             b = bytes.fromhex(hexstr)
             opts = {"type": Variant("s", "command")}
-            await _call_with_timeout(self._ctrl_ch.call_write_value(b, opts), 2.5, f"WriteValue({hexstr[:8]}...)")
+            await self._ctrl_ch.call_write_value(b, opts)
 
         async def send_optical_init():
             await write_cmd("0c91010200040000ff000000")
             await write_cmd("0c91010400040000ff000000")
 
-        _stderr("[jc2] Enabling notifications + optical...")
-
-        # If user doesn't move the controller, some firmwares can sit at zeros for a bit.
-        # These attempts are tuned for "works reliably without hanging".
-        attempts = [
-            (0.10, False),
-            (0.20, True),
-            (0.35, True),
-            (0.60, True),
-        ]
-
+        # Serialize bringup so watchdog + startup can't fight each other.
         async with self._bringup_lock:
-            # First pass: try normal cycles
+            _stderr("[jc2] Enabling notifications + optical...")
+
+            # A few tries helps first-connect flakiness.
+            # NOTE: no disconnect/reconnect here — it causes more harm than good.
+            attempts = [
+                (0.10, False),
+                (0.20, True),
+                (0.35, True),
+                (0.50, True),
+            ]
+
             for i, (delay_s, do_cycle) in enumerate(attempts, 1):
                 if do_cycle:
                     await safe_stop_notify()
@@ -512,43 +639,30 @@ class JC2OpticalMouse:
 
                 await safe_start_notify()
                 await asyncio.sleep(delay_s)
-
                 await send_optical_init()
 
-                # Confirm we are receiving notifications at all
-                if not await self._wait_first_notification(timeout_s=1.25):
-                    continue
+                # Make sure we are actually receiving notifications (handler increments _notif_count).
+                if await self._wait_first_notification(timeout_s=1.0):
+                    # Optional: if optical shows non-zero within a short time, great.
+                    if await self._wait_optical_active(timeout_s=0.8):
+                        _stderr("[jc2] Optical stream active.")
+                        return
 
-                # Give optical a bit more time; small motions help
-                if await self._wait_optical_active(timeout_s=2.25):
-                    _stderr("[jc2] Optical stream active.")
+                    # Not a hard failure — optical can be enabled but stationary / blank.
+                    if self.verbose:
+                        _stderr(f"[jc2][dbg] bringup ok (notifs flowing) but optical deltas still zero (attempt {i})")
+
+                    # Exit early once notifications are confirmed and init was sent;
+                    # watchdog will handle retries if motion never appears.
+                    _stderr("[jc2] Init sent. Optical may be idle until motion/texture is present.")
                     return
 
                 if self.verbose:
-                    _stderr(f"[jc2][dbg] optical inactive on attempt {i}")
+                    _stderr(f"[jc2][dbg] no notifications yet (attempt {i}); retrying...")
 
-            _stderr("[jc2] Optical still inactive after bringup attempts; trying one reconnect cycle...")
+            # If we get here, notifications never started.
+            _stderr("[jc2] ERROR: notifications never started; optical init could not be confirmed.")
 
-            # Second pass: one hard reconnect + one more attempt set
-            await self._cycle_connection_once()
-
-            for i, (delay_s, do_cycle) in enumerate(attempts, 1):
-                if do_cycle:
-                    await safe_stop_notify()
-                    await asyncio.sleep(0.05)
-
-                await safe_start_notify()
-                await asyncio.sleep(delay_s)
-                await send_optical_init()
-
-                if not await self._wait_first_notification(timeout_s=1.25):
-                    continue
-
-                if await self._wait_optical_active(timeout_s=2.25):
-                    _stderr("[jc2] Optical stream active.")
-                    return
-
-        _stderr("[jc2] Init sent, but optical still appears inactive (opt bytes are zero).")
 
 
     # Mode switching helpers
@@ -591,6 +705,11 @@ class JC2OpticalMouse:
         self.ui_pad.write(e.EV_KEY, e.BTN_START, 0)
         self.ui_pad.write(e.EV_KEY, e.BTN_MODE, 0)
         self.ui_pad.write(e.EV_KEY, e.BTN_THUMBL, 0)
+        self.ui_pad.write(e.EV_KEY, e.BTN_DPAD_UP, 0)
+        self.ui_pad.write(e.EV_KEY, e.BTN_DPAD_DOWN, 0)
+        self.ui_pad.write(e.EV_KEY, e.BTN_DPAD_LEFT, 0)
+        self.ui_pad.write(e.EV_KEY, e.BTN_DPAD_RIGHT, 0)
+
 
         self.ui_pad.write(e.EV_ABS, e.ABS_X, 32768)
         self.ui_pad.write(e.EV_ABS, e.ABS_Y, 32768)
@@ -607,13 +726,14 @@ class JC2OpticalMouse:
         Returns (x12, y12, cx, cy) once calibrated, else None.
         Maintains calibration / gentle recenter.
         """
-        if len(data) <= STICK_BASE_IDX + 2:
+        base = self._stick_base_idx
+        if len(data) <= base + 2:
             self._prev_notif_ts = now if self._prev_notif_ts is None else self._prev_notif_ts
             return None
 
-        b0 = data[STICK_BASE_IDX]
-        b1 = data[STICK_BASE_IDX + 1]
-        b2 = data[STICK_BASE_IDX + 2]
+        b0 = data[base]
+        b1 = data[base + 1]
+        b2 = data[base + 2]
 
         self._last_stick_raw = (b0, b1, b2)
         x12, y12 = decode_stick_12(b0, b1, b2)
@@ -627,14 +747,28 @@ class JC2OpticalMouse:
             dt = now - self._prev_notif_ts
         self._prev_notif_ts = now
 
+        # Clamp dt to sane bounds so occasional stalls don’t fling the wheel.
+        if dt > 0.0:
+            self._last_notif_dt = clamp(dt, 1.0 / 240.0, 1.0 / 10.0)
+
+
         # calibration
         if self._stick_center_x12 is None or self._stick_center_y12 is None:
             self._stick_cal_x.append(x12)
             self._stick_cal_y.append(y12)
-            if len(self._stick_cal_x) >= STICK_CAL_SAMPLES:
+
+            # Gamepad mode needs to feel responsive: calibrate fast.
+            # Mouse mode can keep the longer median calibration.
+            need = 5 if self.mode == "gamepad" else STICK_CAL_SAMPLES
+
+            if len(self._stick_cal_x) >= need:
                 self._stick_center_x12 = int(statistics.median(self._stick_cal_x))
                 self._stick_center_y12 = int(statistics.median(self._stick_cal_y))
+                # Once we have a center, immediately start returning values
+                return x12, y12, self._stick_center_x12, self._stick_center_y12
+
             return None
+
 
         # gentle recenter
         dx0 = x12 - self._stick_center_x12
@@ -656,7 +790,8 @@ class JC2OpticalMouse:
         # approximate dt since prev_notif_ts updated in _decode_stick_and_calibrate
         # (we can’t perfectly recover it here; good enough for smooth scroll)
         # optionally use small fixed dt based on typical notif rate
-        dt = 1.0 / 40.0
+        dt = float(self._last_notif_dt)
+
 
         dy = y12 - cy
         if abs(dy) <= STICK_DEADZONE_12:
@@ -689,9 +824,14 @@ class JC2OpticalMouse:
 
     def _emit_gamepad_stick(self, x12: int, y12: int, cx: int, cy: int):
         """
-        Gamepad mode: use stick as analog (rotated clockwise).
-        We build a signed vector around center, invert Y so up is positive,
-        then rotate clockwise: (x,y) -> (y, -x)
+        Gamepad mode: emit ABS_X/ABS_Y with a side-aware 90° rotation.
+
+        Coordinate convention here:
+          dx = +right
+          dy = +up  (we compute dy = cy - y12)
+
+        Right Joy-Con held sideways rail-up is a clockwise rotation.
+        Left  Joy-Con held sideways rail-up is a counter-clockwise rotation.
         """
         dx = x12 - cx
         dy = cy - y12  # invert so up is positive
@@ -702,9 +842,15 @@ class JC2OpticalMouse:
         if abs(dy) <= STICK_DEADZONE_12:
             dy = 0
 
-        # rotate clockwise
-        rx = dy
-        ry = -dx
+        # Rotate 90° depending on side
+        if self.side == "left":
+            # counter-clockwise: (x,y) -> (-y, x)
+            rx = -dy
+            ry = dx
+        else:
+            # clockwise: (x,y) -> (y, -x)
+            rx = dy
+            ry = -dx
 
         # clamp to range [-2048, +2048]
         rx = int(clamp(rx, -2048, 2048))
@@ -714,12 +860,13 @@ class JC2OpticalMouse:
         ax = int(clamp(32768 + (rx * 32768 / 2048), 0, 65535))
         ay = int(clamp(32768 - (ry * 32768 / 2048), 0, 65535))  # ABS_Y down is +
 
-        # FIX: invert X so left is left
+        # Keep the same "left is left" correction you already had
         ax = 65535 - ax
 
         self.ui_pad.write(e.EV_ABS, e.ABS_X, ax)
         self.ui_pad.write(e.EV_ABS, e.ABS_Y, ay)
         self.ui_pad.syn()
+
 
 
     # -------------------------
@@ -730,24 +877,65 @@ class JC2OpticalMouse:
         self._notif_count += 1
         self._last_notif_ts = now
 
+        # Fallback side inference (only if ManufacturerData detection didn't run / failed)
+        if self.side == "unknown" and len(data) >= 7:
+            # Left: byte6 carries dpad/SL/SR/L/ZL bits; Right: byte4 carries ABXY bits
+            b4 = data[4]
+            b6 = data[6]
+            left_hint = (b6 & 0x0F) != 0 or (b6 & 0xC0) != 0 or (b6 & 0x30) != 0
+            right_hint = (b4 & 0x0F) != 0 or (b4 & 0xF0) != 0
+            if left_hint and not right_hint:
+                self.side = "left"
+                self._btn_face_idx = LEFT_BTN_FACE_IDX
+                self._btn_misc_idx = LEFT_BTN_MISC_IDX
+                self._stick_base_idx = STICK_BASE_LEFT
+
+            elif right_hint and not left_hint:
+                self.side = "right"
+                self._btn_face_idx = RIGHT_BTN_FACE_IDX
+                self._btn_misc_idx = RIGHT_BTN_MISC_IDX
+                self._stick_base_idx = STICK_BASE_RIGHT
+
+
+
         # record button bytes (status)
         if len(data) > 4:
             self._last_raw_b4 = data[4]
         if len(data) > 5:
             self._last_raw_b5 = data[5]
 
-        # --- Mode toggle (C button) edge-detect ---
-        mode_btn = btn_pressed(data, BTN5, BTN_C)
-        if mode_btn and not self._prev_mode_btn:
-            new_mode = "gamepad" if self.mode == "mouse" else "mouse"
-            self._set_mode(new_mode)
+        # --- Mode toggle ---
+        if self.side != "left":
+            # Right JC2: C button edge toggle (uses misc byte)
+            mode_btn = self._btn_misc(data, BTN_C)
+            if mode_btn and not self._prev_mode_btn:
+                self._set_mode("gamepad" if self.mode == "mouse" else "mouse")
+                if self.mode == "gamepad":
+                    self._last_opt_active_ts = now
+            self._prev_mode_btn = mode_btn
 
-            # When entering gamepad mode, don't let optical watchdog think we're "dead"
-            if self.mode == "gamepad":
-                self._last_opt_active_ts = time.time()
+        else:
+            # Left JC2: hold L + ZL to toggle (avoids stealing SL/SR)
+            hold = self._btn_face(data, LBTN_L) and self._btn_face(data, LBTN_ZL)
 
-        self._prev_mode_btn = mode_btn
- 
+            self._left_toggle_hold_active = hold
+
+            if not hold:
+                self._left_toggle_hold_active = False
+
+            if hold and not self._left_hold_latched:
+                if self._left_hold_start == 0.0:
+                    self._left_hold_start = now
+                elif (now - self._left_hold_start) >= LEFT_MODE_TOGGLE_HOLD_S:
+                    self._left_hold_latched = True
+                    self._set_mode("gamepad" if self.mode == "mouse" else "mouse")
+                    if self.mode == "gamepad":
+                        self._last_opt_active_ts = now
+
+            if not hold:
+                self._left_hold_start = 0.0
+                self._left_hold_latched = False
+
 
         # --- Stick decode ---
         stick = self._decode_stick_and_calibrate(data, now)
@@ -761,101 +949,269 @@ class JC2OpticalMouse:
                 # stick -> analog in gamepad mode
                 self._emit_gamepad_stick(x12, y12, cx, cy)
 
-        # --- Buttons ---
-        # Face buttons raw
-        a = btn_pressed(data, BTN4, BTN_A)
-        b = btn_pressed(data, BTN4, BTN_B)
-        x = btn_pressed(data, BTN4, BTN_X)
-        y = btn_pressed(data, BTN4, BTN_Y)
+                # --- Buttons ---
+        if self.side != "left":
+            # -------------------------
+            # Right Joy-Con 2 (existing behavior)
+            # -------------------------
+            a = btn_pressed(data, BTN4, BTN_A)
+            b = btn_pressed(data, BTN4, BTN_B)
+            x = btn_pressed(data, BTN4, BTN_X)
+            y = btn_pressed(data, BTN4, BTN_Y)
 
-        sr = btn_pressed(data, BTN4, BTN_SR)
-        sl = btn_pressed(data, BTN4, BTN_SL)
+            sr = btn_pressed(data, BTN4, BTN_SR)
+            sl = btn_pressed(data, BTN4, BTN_SL)
 
-        # "shoulder" + "trigger" (on Right JC2)
-        sh = btn_pressed(data, BTN4, BTN_L)
-        tr = btn_pressed(data, BTN4, BTN_ZL)
+            sh = btn_pressed(data, BTN4, BTN_L)   # effectively R
+            tr = btn_pressed(data, BTN4, BTN_ZL)  # effectively ZR
 
-        home = btn_pressed(data, BTN5, BTN_HOME)
-        r3 = btn_pressed(data, BTN5, BTN_R3)
+            home = btn_pressed(data, BTN5, BTN_HOME)
+            r3 = btn_pressed(data, BTN5, BTN_R3)
 
-        if self.mode == "mouse":
-            # mouse clicks
-            left = sh        # bumper -> left click
-            right = tr       # trigger -> right click
-            middle = r3      # stick click -> middle click
+            if self.mode == "mouse":
+                left = sh
+                right = tr
+                middle = r3
 
-            if left != self._prev_left:
-                self.ui_mouse.write(e.EV_KEY, e.BTN_LEFT, 1 if left else 0)
-                self._prev_left = left
+                if left != self._prev_left:
+                    self.ui_mouse.write(e.EV_KEY, e.BTN_LEFT, 1 if left else 0)
+                    self._prev_left = left
+                if right != self._prev_right:
+                    self.ui_mouse.write(e.EV_KEY, e.BTN_RIGHT, 1 if right else 0)
+                    self._prev_right = right
+                if middle != self._prev_middle:
+                    self.ui_mouse.write(e.EV_KEY, e.BTN_MIDDLE, 1 if middle else 0)
+                    self._prev_middle = middle
 
-            if right != self._prev_right:
-                self.ui_mouse.write(e.EV_KEY, e.BTN_RIGHT, 1 if right else 0)
-                self._prev_right = right
+                self._handle_optical_motion(data, now)
+                self.ui_mouse.syn()
 
-            if middle != self._prev_middle:
-                self.ui_mouse.write(e.EV_KEY, e.BTN_MIDDLE, 1 if middle else 0)
-                self._prev_middle = middle
+            else:
+                # -------------------------
+                # GAMEPAD MODE (Right Joy-Con 2, held sideways, rail up)
+                # -------------------------
+                # In this physical orientation, the printed Joy-Con letters end up at:
+                #   North (top)    = Y
+                #   East  (right)  = X
+                #   South (bottom) = A
+                #   West  (left)   = B
+                #
+                # We emit an Xbox-style positional gamepad:
+                #   Xbox A = BTN_SOUTH
+                #   Xbox B = BTN_EAST
+                #   Xbox X = BTN_WEST
+                #   Xbox Y = BTN_NORTH
+                #
+                # Therefore:
+                #   BTN_SOUTH (A) = physical A
+                #   BTN_EAST  (B) = physical X
+                #   BTN_WEST  (X) = physical B
+                #   BTN_NORTH (Y) = physical Y
+                #
+                # Note: Some stacks can appear to "swap" certain face buttons depending on
+                # mapping layers (Steam/SDL/browser APIs). If needed, enable the compat swaps
+                # below — but they are NOT treated as hardware truths.
 
-            # optical motion only in mouse mode
-            self._handle_optical_motion(data, now)
+                COMPAT_SWAP_SOUTH_EAST = False  # swap A/B positions
+                COMPAT_SWAP_WEST_NORTH = True  # swap X/Y positions
 
-            # sync for button changes (motion pump does its own syn)
-            self.ui_mouse.syn()
+                # Physical Joy-Con letters from packet:
+                # a,b,x,y correspond to the printed labels on the Joy-Con.
+                # For rail-up sideways, map by physical position as described above.
+                gp_south = a   # Xbox A  (bottom)  <- Joy-Con A
+                gp_east  = x   # Xbox B  (right)   <- Joy-Con X
+                gp_west  = b   # Xbox X  (left)    <- Joy-Con B
+                gp_north = y   # Xbox Y  (top)     <- Joy-Con Y
 
+                if COMPAT_SWAP_SOUTH_EAST:
+                    gp_south, gp_east = gp_east, gp_south
+                if COMPAT_SWAP_WEST_NORTH:
+                    gp_west, gp_north = gp_north, gp_west
+
+                # shoulders: SL/SR -> LB/RB
+                gp_tl = sl
+                gp_tr = sr
+
+                # + and HOME mapping
+                plus = btn_pressed(data, BTN5, BTN_PLUS)
+                gp_start  = plus        # +    -> START
+                gp_select = home        # HOME -> SELECT/BACK
+
+                # optional: R3 -> THUMBL
+                gp_thumb = r3
+
+                def emit_btn(keycode, name, pressed):
+                    prev = self._gp_prev[name]
+                    if pressed != prev:
+                        self.ui_pad.write(e.EV_KEY, keycode, 1 if pressed else 0)
+                        self._gp_prev[name] = pressed
+
+                emit_btn(e.BTN_SOUTH,  "south",  gp_south)
+                emit_btn(e.BTN_EAST,   "east",   gp_east)
+                emit_btn(e.BTN_WEST,   "west",   gp_west)
+                emit_btn(e.BTN_NORTH,  "north",  gp_north)
+                emit_btn(e.BTN_TL,     "tl",     gp_tl)
+                emit_btn(e.BTN_TR,     "tr",     gp_tr)
+                emit_btn(e.BTN_SELECT, "select", gp_select)
+                emit_btn(e.BTN_START,  "start",  gp_start)
+                emit_btn(e.BTN_THUMBL, "thumb",  gp_thumb)
+
+                self.ui_pad.syn()
         else:
-            # GAMEPAD MODE
-            #
-            # Horizontal (clockwise) mapping:
-            #   A -> B
-            #   B -> Y
-            #   Y -> X
-            #   X -> A
-            #
-            # Then map virtual A/B/X/Y to Xbox-style BTN_SOUTH/EAST/NORTH/WEST:
-            #   vA -> SOUTH, vB -> EAST, vX -> NORTH, vY -> WEST
-            vA = x
-            vB = a
-            vX = y
-            vY = b
+            # -------------------------
+            # Left Joy-Con 2
+            # -------------------------
+            minus   = self._btn_misc(data, LBTN_MINUS)
+            l3      = self._btn_misc(data, LBTN_L3)
+            capture = self._btn_misc(data, LBTN_CAPTURE)
 
-            gp_south = vA
-            gp_east  = vB
-            gp_north = vX
-            gp_west  = vY
+            ddown  = self._btn_face(data, LBTN_DDOWN)
+            dup    = self._btn_face(data, LBTN_DUP)
+            dright = self._btn_face(data, LBTN_DRIGHT)
+            dleft  = self._btn_face(data, LBTN_DLEFT)
 
-            # shoulders: SL/SR -> LB/RB
-            gp_tl = sl
-            gp_tr = sr
+            sr = self._btn_face(data, LBTN_SR)
+            sl = self._btn_face(data, LBTN_SL)
 
-            # + and HOME mapping
-            plus = btn_pressed(data, BTN5, BTN_PLUS)
-            gp_start  = plus          # +  -> START
-            gp_select = home          # HOME -> SELECT/BACK
+            l  = self._btn_face(data, LBTN_L)
+            zl = self._btn_face(data, LBTN_ZL)
 
-            # optional: R3 -> THUMBL
-            gp_thumb = r3
+            if self.mode == "mouse":
+                # Mouse mode:
+                #   L  -> left click
+                #   ZL -> right click
+                #   L3 -> middle click
+                # Suppress clicks while holding L+ZL to toggle modes
+                if self._left_toggle_hold_active:
+                    left = False
+                    right = False
+                else:
+                    left = l
+                    right = zl
 
-            # disable shoulder/trigger (sh/tr)
-            _ = sh
-            _ = tr
+                middle = l3
 
-            def emit_btn(keycode, name, pressed):
-                prev = self._gp_prev[name]
-                if pressed != prev:
-                    self.ui_pad.write(e.EV_KEY, keycode, 1 if pressed else 0)
-                    self._gp_prev[name] = pressed
 
-            emit_btn(e.BTN_SOUTH,  "south",  gp_south)
-            emit_btn(e.BTN_EAST,   "east",   gp_east)
-            emit_btn(e.BTN_NORTH,  "north",  gp_north)
-            emit_btn(e.BTN_WEST,   "west",   gp_west)
-            emit_btn(e.BTN_TL,     "tl",     gp_tl)
-            emit_btn(e.BTN_TR,     "tr",     gp_tr)
-            emit_btn(e.BTN_SELECT, "select", gp_select)
-            emit_btn(e.BTN_START,  "start",  gp_start)
-            emit_btn(e.BTN_THUMBL, "thumb",  gp_thumb)
+                if left != self._prev_left:
+                    self.ui_mouse.write(e.EV_KEY, e.BTN_LEFT, 1 if left else 0)
+                    self._prev_left = left
+                if right != self._prev_right:
+                    self.ui_mouse.write(e.EV_KEY, e.BTN_RIGHT, 1 if right else 0)
+                    self._prev_right = right
+                if middle != self._prev_middle:
+                    self.ui_mouse.write(e.EV_KEY, e.BTN_MIDDLE, 1 if middle else 0)
+                    self._prev_middle = middle
 
-            self.ui_pad.syn()
+                # Optical motion + stick scroll already handled (same as right)
+                self._handle_optical_motion(data, now)
+                self.ui_mouse.syn()
+
+            else:
+                # -------------------------
+                # Left Joy-Con 2 — GAMEPAD MODE (held sideways, rail up)
+                # -------------------------
+                # The "face cluster" is a D-pad bitfield in vertical orientation.
+                # When held sideways (counter-clockwise rotation):
+                #   Physical Up    (was D-pad Right) -> Xbox Y (BTN_NORTH)
+                #   Physical Right (was D-pad Down)  -> Xbox B (BTN_EAST)
+                #   Physical Down  (was D-pad Left)  -> Xbox A (BTN_SOUTH)
+                #   Physical Left  (was D-pad Up)    -> Xbox X (BTN_WEST)
+
+                    phys_up    = dright
+                    phys_right = ddown
+                    phys_down  = dleft
+                    phys_left  = dup
+
+                    LCOMPAT_SWAP_SOUTH_EAST = False  # swap A/B positions
+                    LCOMPAT_SWAP_WEST_NORTH = True  # swap X/Y positions
+
+                    # Map to Xbox face buttons (positional)
+                    gp_north = phys_up     # Xbox Y
+                    gp_east  = phys_right  # Xbox B
+                    gp_south = phys_down   # Xbox A
+                    gp_west  = phys_left   # Xbox X
+
+                    if LCOMPAT_SWAP_SOUTH_EAST:
+                        gp_south, gp_east = gp_east, gp_south
+                    if LCOMPAT_SWAP_WEST_NORTH:
+                        gp_west, gp_north = gp_north, gp_west
+
+                    # SL/SR should act as LB/RB in horizontal mode
+                    gp_tl = sl
+                    gp_tr = sr
+
+                    # Start/Select
+                    gp_select = minus
+                    gp_start  = capture
+
+                    # Stick click
+                    gp_thumb = l3
+
+                    # L/ZL are reserved for mode-toggle chord; do not emit them in gamepad mode.
+                    # (No mapping here by design.)
+
+                    def emit_btn(keycode, name, pressed):
+                        prev = self._gp_prev[name]
+                        if pressed != prev:
+                            self.ui_pad.write(e.EV_KEY, keycode, 1 if pressed else 0)
+                            self._gp_prev[name] = pressed
+
+                    emit_btn(e.BTN_SOUTH,  "south",  gp_south)
+                    emit_btn(e.BTN_EAST,   "east",   gp_east)
+                    emit_btn(e.BTN_WEST,   "west",   gp_west)
+                    emit_btn(e.BTN_NORTH,  "north",  gp_north)
+
+                    emit_btn(e.BTN_TL,     "tl",     gp_tl)
+                    emit_btn(e.BTN_TR,     "tr",     gp_tr)
+                    emit_btn(e.BTN_SELECT, "select", gp_select)
+                    emit_btn(e.BTN_START,  "start",  gp_start)
+                    emit_btn(e.BTN_THUMBL, "thumb",  gp_thumb)
+
+                    self.ui_pad.syn()
+
+
+
+
+    def _btn_face(self, data: bytes, mask: int) -> bool:
+        return len(data) > self._btn_face_idx and (data[self._btn_face_idx] & mask) != 0
+
+    def _btn_misc(self, data: bytes, mask: int) -> bool:
+        return len(data) > self._btn_misc_idx and (data[self._btn_misc_idx] & mask) != 0
+
+    async def _detect_and_configure_side(self, props) -> None:
+        """
+        Detect left/right via ManufacturerData (same signal as CLI),
+        then set button byte indices accordingly.
+        """
+        try:
+            md = await props.call_get(DEVICE_IFACE, "ManufacturerData")
+            md = _unwrap(md)
+            if not isinstance(md, dict) or NINTENDO_COMPANY_ID not in md:
+                return
+
+            raw = _unwrap(md[NINTENDO_COMPANY_ID])
+            mfg = bytes(raw)
+            if len(mfg) != JC2_MFG_LEN or not mfg.startswith(JC2_MFG_PREFIX):
+                return
+
+            sb = mfg[JC2_SIDE_BYTE_IDX]
+            if sb == JC2_SIDE_RIGHT:
+                self.side = "right"
+            elif sb == JC2_SIDE_LEFT:
+                self.side = "left"
+            else:
+                self.side = "unknown"
+        except Exception:
+            return
+
+        if self.side == "left":
+            self._btn_face_idx = LEFT_BTN_FACE_IDX
+            self._btn_misc_idx = LEFT_BTN_MISC_IDX
+            self._stick_base_idx = STICK_BASE_LEFT
+        else:
+            self._btn_face_idx = RIGHT_BTN_FACE_IDX
+            self._btn_misc_idx = RIGHT_BTN_MISC_IDX
+            self._stick_base_idx = STICK_BASE_RIGHT
 
 
     def _handle_optical_motion(self, data: bytes, now: float):
@@ -992,25 +1348,29 @@ async def run(mac: str, *, status: bool = True, status_hz: float = 5.0, verbose:
         await asyncio.sleep(0.2)
         now = time.time()
 
-        # watchdog: Only enforce optical bringup in MOUSE mode.
+        # Optical watchdog ONLY in mouse mode
         if drv.mode == "mouse":
             age = (now - drv._last_notif_ts) if drv._last_notif_ts else 999.0
 
+            # Only warn/retry if notifications are alive but optical hasn't shown activity for a while
             if age < 0.5 and (now - drv._last_opt_active_ts) > 2.0:
                 if (now - drv._last_opt_warn_ts) > 5.0:
                     drv._last_opt_warn_ts = now
-                    sys.stderr.write("\n[jc2] WARNING: optical inactive; re-sending notify + optical init...\n")
+                    sys.stderr.write("\n[jc2] WARNING: optical idle; retrying notify+init...\n")
                     sys.stderr.flush()
 
                 if (now - last_restart) > 3.0:
                     last_restart = now
                     try:
-                        async with drv._bringup_lock:
-                            await drv.ensure_notify_and_init()
+                        await drv.ensure_notify_and_init()
                     except Exception as ex:
                         if verbose:
                             sys.stderr.write(f"[jc2] optical restart failed: {ex}\n")
                             sys.stderr.flush()
+        else:
+            # In gamepad mode, don't spam optical re-inits
+            age = (now - drv._last_notif_ts) if drv._last_notif_ts else 999.0
+
 
 
         if not status:

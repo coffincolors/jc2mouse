@@ -1406,3 +1406,935 @@ async def run(mac: str, *, status: bool = True, status_hz: float = 5.0, verbose:
                 f"opt=[{opt_s}]   "
             )
             sys.stderr.flush()
+
+# ============================================================
+# Combined full-controller mode (Left + Right Joy-Con 2)
+#   - Exposes ONE virtual Xbox-ish gamepad
+#   - Right C toggles "Right-only mouse mode":
+#       * Right contributes mouse (optical + clicks + scroll)
+#       * Right gamepad half is suppressed
+#       * Left continues contributing left half of gamepad
+# ============================================================
+
+from dbus_next.errors import DBusError
+
+
+def _abs_from_rxry(rx: int, ry: int) -> tuple[int, int]:
+    """Map signed [-2048..2048] to [0..65535] with center 32768."""
+    ax = int(clamp(32768 + (rx * 32768 / 2048), 0, 65535))
+    ay = int(clamp(32768 - (ry * 32768 / 2048), 0, 65535))  # ABS_Y down is +
+    return ax, ay
+
+
+def _rotate_stick_for_side(side: str, x12: int, y12: int, cx: int, cy: int) -> tuple[int, int]:
+    """
+    Return (rx, ry) as signed stick deflection after "sideways rail-up" rotation.
+    Convention:
+      dx = +right
+      dy = +up  (we compute dy = cy - y12)
+    Right Joy-Con sideways rail-up => clockwise  90°: (x,y)->( y, -x)
+    Left  Joy-Con sideways rail-up => counterCW  90°: (x,y)->(-y,  x)
+    """
+    dx = x12 - cx
+    dy = cy - y12  # up positive
+
+    if abs(dx) <= STICK_DEADZONE_12:
+        dx = 0
+    if abs(dy) <= STICK_DEADZONE_12:
+        dy = 0
+
+    if side == "left":
+        rx = -dy
+        ry = dx
+    else:
+        rx = dy
+        ry = -dx
+
+    rx = int(clamp(rx, -2048, 2048))
+    ry = int(clamp(ry, -2048, 2048))
+    return rx, ry
+
+
+class _JC2Endpoint:
+    """
+    BLE transport + minimal decode state for a single Joy-Con 2.
+    No uinput here — Combined controller owns uinput.
+    """
+
+    def __init__(self, mac: str, *, expected_side: str, verbose: bool = False):
+        self.mac = mac.upper()
+        self.expected_side = expected_side  # "left" or "right"
+        self.verbose = verbose
+
+        self.notify_uuid = DEFAULT_NOTIFY_UUID.lower()
+        self.ctrl_uuid = DEFAULT_CTRL_UUID.lower()
+
+        self.bus: MessageBus | None = None
+        self.objects = None
+        self.dev_path: str | None = None
+        self.notify_path: str | None = None
+        self.ctrl_path: str | None = None
+
+        self._dev = None
+        self._dev_props = None
+        self._notify_props = None
+        self._notify_ch = None
+        self._ctrl_ch = None
+        self._handler_installed = False
+
+        # side + indices
+        self.side = "unknown"
+        self._btn_face_idx = RIGHT_BTN_FACE_IDX
+        self._btn_misc_idx = RIGHT_BTN_MISC_IDX
+        self._stick_base_idx = STICK_BASE_RIGHT
+
+        # telemetry
+        self.notif_count = 0
+        self.last_notif_ts = 0.0
+        self.last_raw_b4 = 0
+        self.last_raw_b5 = 0
+
+        # stick decode/cal
+        self._stick_center_x12: int | None = None
+        self._stick_center_y12: int | None = None
+        self._stick_cal_x: list[int] = []
+        self._stick_cal_y: list[int] = []
+        self.last_stick_raw = (0, 0, 0)
+        self.last_stick_x12 = 0
+        self.last_stick_y12 = 0
+
+        # buttons (decoded booleans)
+        self.btn = {}
+
+        # Right-only: C edge
+        self._prev_c = False
+        self.c_edge = False
+
+        # Right-only: optical accumulation for mouse
+        self.prev_x16: int | None = None
+        self.prev_y16: int | None = None
+        self.dx_accum = 0.0
+        self.dy_accum = 0.0
+        self.last_motion_ts = 0.0
+
+        self.last_opt: bytes | None = None
+        self.last_opt_ts = 0.0
+        self.last_opt_active_ts = 0.0
+        self.last_opt_dx = 0
+        self.last_opt_dy = 0
+
+    async def _get_managed_objects(self):
+        intro = await self.bus.introspect(BLUEZ, "/")
+        om_obj = self.bus.get_proxy_object(BLUEZ, "/", intro)
+        om = om_obj.get_interface(OM_IFACE)
+        return await om.call_get_managed_objects()
+
+    def _find_device_path(self):
+        suffix = "dev_" + self.mac.replace(":", "_")
+        for path, ifaces in self.objects.items():
+            if path.endswith(suffix) and DEVICE_IFACE in ifaces:
+                return path
+        raise RuntimeError(f"Device {self.mac} not found in BlueZ object tree.")
+
+    async def _wait_services_resolved(self, timeout_s: float = 8.0) -> None:
+        dev_intro = await self.bus.introspect(BLUEZ, self.dev_path)
+        dev_obj = self.bus.get_proxy_object(BLUEZ, self.dev_path, dev_intro)
+        props = dev_obj.get_interface(PROP_IFACE)
+
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            try:
+                v = await props.call_get(DEVICE_IFACE, "ServicesResolved")
+                if bool(_unwrap(v)):
+                    return
+            except Exception:
+                pass
+            await asyncio.sleep(0.15)
+
+        raise RuntimeError("Timed out waiting for ServicesResolved=True")
+
+    async def _refresh_objects_until_gatt(self, timeout_s: float = 60.0) -> bool:
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            self.objects = await self._get_managed_objects()
+
+            found_notify = False
+            found_ctrl = False
+            for path, ifaces in self.objects.items():
+                ch = ifaces.get(GATT_CHRC_IFACE)
+                if not ch:
+                    continue
+                if self.dev_path and not path.startswith(self.dev_path + "/"):
+                    continue
+
+                uuid = str(_unwrap(ch.get("UUID", "")) or "").lower()
+                if uuid == self.notify_uuid:
+                    found_notify = True
+                if uuid == self.ctrl_uuid:
+                    found_ctrl = True
+
+            if found_notify and found_ctrl:
+                return True
+
+            await asyncio.sleep(0.25)
+
+        return False
+
+    def _pick_characteristics(self):
+        notify_path = None
+        ctrl_path = None
+        for path, ifaces in self.objects.items():
+            ch = ifaces.get(GATT_CHRC_IFACE)
+            if not ch:
+                continue
+            if self.dev_path and not path.startswith(self.dev_path + "/"):
+                continue
+
+            uuid = str(_unwrap(ch.get("UUID", "")) or "").lower()
+            if uuid == self.notify_uuid:
+                notify_path = path
+            if uuid == self.ctrl_uuid:
+                ctrl_path = path
+
+        if not notify_path:
+            raise RuntimeError(f"Notify characteristic UUID not found: {self.notify_uuid}")
+        if not ctrl_path:
+            raise RuntimeError(f"Control characteristic UUID not found: {self.ctrl_uuid}")
+
+        self.notify_path = notify_path
+        self.ctrl_path = ctrl_path
+
+    async def _detect_and_configure_side(self, props) -> None:
+        """
+        Detect left/right via ManufacturerData (0x66=right, 0x67=left).
+        Fallback to expected_side if unknown.
+        """
+        side = "unknown"
+        try:
+            md = await props.call_get(DEVICE_IFACE, "ManufacturerData")
+            md = _unwrap(md)
+            if isinstance(md, dict) and NINTENDO_COMPANY_ID in md:
+                raw = _unwrap(md[NINTENDO_COMPANY_ID])
+                mfg = bytes(raw)
+                if len(mfg) == JC2_MFG_LEN and mfg.startswith(JC2_MFG_PREFIX):
+                    sb = mfg[JC2_SIDE_BYTE_IDX]
+                    if sb == JC2_SIDE_RIGHT:
+                        side = "right"
+                    elif sb == JC2_SIDE_LEFT:
+                        side = "left"
+        except Exception:
+            pass
+
+        if side == "unknown":
+            side = self.expected_side
+
+        self.side = side
+        if self.side == "left":
+            self._btn_face_idx = LEFT_BTN_FACE_IDX
+            self._btn_misc_idx = LEFT_BTN_MISC_IDX
+            self._stick_base_idx = STICK_BASE_LEFT
+        else:
+            self._btn_face_idx = RIGHT_BTN_FACE_IDX
+            self._btn_misc_idx = RIGHT_BTN_MISC_IDX
+            self._stick_base_idx = STICK_BASE_RIGHT
+
+    def _btn_face(self, data: bytes, mask: int) -> bool:
+        return len(data) > self._btn_face_idx and (data[self._btn_face_idx] & mask) != 0
+
+    def _btn_misc(self, data: bytes, mask: int) -> bool:
+        return len(data) > self._btn_misc_idx and (data[self._btn_misc_idx] & mask) != 0
+
+    def _decode_stick_and_calibrate(self, data: bytes) -> tuple[int, int, int, int] | None:
+        base = self._stick_base_idx
+        if len(data) <= base + 2:
+            return None
+
+        b0 = data[base]
+        b1 = data[base + 1]
+        b2 = data[base + 2]
+        self.last_stick_raw = (b0, b1, b2)
+
+        x12, y12 = decode_stick_12(b0, b1, b2)
+        self.last_stick_x12 = x12
+        self.last_stick_y12 = y12
+
+        if self._stick_center_x12 is None or self._stick_center_y12 is None:
+            self._stick_cal_x.append(x12)
+            self._stick_cal_y.append(y12)
+            if len(self._stick_cal_x) >= 5:  # fast center lock for combined mode
+                self._stick_center_x12 = int(statistics.median(self._stick_cal_x))
+                self._stick_center_y12 = int(statistics.median(self._stick_cal_y))
+                return x12, y12, self._stick_center_x12, self._stick_center_y12
+            return None
+
+        # gentle recenter
+        dx0 = x12 - self._stick_center_x12
+        dy0 = y12 - self._stick_center_y12
+        if abs(dx0) <= STICK_RECENTER_RADIUS and abs(dy0) <= STICK_RECENTER_RADIUS:
+            cx = self._stick_center_x12 * (1.0 - STICK_RECENTER_ALPHA) + x12 * STICK_RECENTER_ALPHA
+            cy = self._stick_center_y12 * (1.0 - STICK_RECENTER_ALPHA) + y12 * STICK_RECENTER_ALPHA
+            self._stick_center_x12 = int(cx)
+            self._stick_center_y12 = int(cy)
+
+        return x12, y12, self._stick_center_x12, self._stick_center_y12
+
+    def _handle_optical_motion(self, data: bytes, now: float):
+        if len(data) < OPT_OFFSET + OPT_LEN:
+            return
+        opt = data[OPT_OFFSET: OPT_OFFSET + OPT_LEN]
+        self.last_opt = opt
+        self.last_opt_ts = now
+        if any(b != 0 for b in opt[1:]):
+            self.last_opt_active_ts = now
+
+        x16 = u16_from_opt(opt, X_LO_IDX, X_HI_IDX)
+        y16 = u16_from_opt(opt, Y_LO_IDX, Y_HI_IDX)
+
+        if self.prev_x16 is None:
+            self.prev_x16, self.prev_y16 = x16, y16
+            dx = 0
+            dy = 0
+        else:
+            dx = delta_u16(x16, self.prev_x16)
+            dy = delta_u16(y16, self.prev_y16)
+            self.prev_x16, self.prev_y16 = x16, y16
+
+        if INVERT_X:
+            dx = -dx
+        if INVERT_Y:
+            dy = -dy
+
+        if abs(dx) <= DEADZONE:
+            dx = 0
+        if abs(dy) <= DEADZONE:
+            dy = 0
+
+        self.last_opt_dx = dx
+        self.last_opt_dy = dy
+
+        if dx != 0 or dy != 0:
+            self.last_motion_ts = now
+            mdx = float(clamp(dx * SENS_X, -MAX_STEP, MAX_STEP))
+            mdy = float(clamp(dy * SENS_Y, -MAX_STEP, MAX_STEP))
+            if mdx != 0.0 or mdy != 0.0:
+                self.dx_accum += mdx
+                self.dy_accum += mdy
+
+    def handle_notification(self, data: bytes):
+        now = time.time()
+        self.notif_count += 1
+        self.last_notif_ts = now
+
+        if len(data) > 4:
+            self.last_raw_b4 = data[4]
+        if len(data) > 5:
+            self.last_raw_b5 = data[5]
+
+        # stick state
+        self._decode_stick_and_calibrate(data)
+
+        # decode buttons into a stable dict
+        b = {}
+
+        if self.side == "right":
+            # face (byte4)
+            b["a"] = btn_pressed(data, 4, BTN_A)
+            b["b"] = btn_pressed(data, 4, BTN_B)
+            b["x"] = btn_pressed(data, 4, BTN_X)
+            b["y"] = btn_pressed(data, 4, BTN_Y)
+            b["sl"] = btn_pressed(data, 4, BTN_SL)
+            b["sr"] = btn_pressed(data, 4, BTN_SR)
+            b["r"] = btn_pressed(data, 4, BTN_L)    # effectively R
+            b["zr"] = btn_pressed(data, 4, BTN_ZL)  # effectively ZR
+
+            # misc (byte5)
+            b["plus"] = btn_pressed(data, 5, BTN_PLUS)
+            b["r3"] = btn_pressed(data, 5, BTN_R3)
+            b["home"] = btn_pressed(data, 5, BTN_HOME)
+            c = btn_pressed(data, 5, BTN_C)
+            b["c"] = c
+
+            # edge detect C
+            self.c_edge = bool(c and not self._prev_c)
+            self._prev_c = bool(c)
+
+            # optical accumulation available for right mouse mode
+            self._handle_optical_motion(data, now)
+
+        else:
+            # misc byte5
+            b["minus"] = self._btn_misc(data, LBTN_MINUS)
+            b["l3"] = self._btn_misc(data, LBTN_L3)
+            b["capture"] = self._btn_misc(data, LBTN_CAPTURE)
+
+            # face byte6
+            b["dup"] = self._btn_face(data, LBTN_DUP)
+            b["ddown"] = self._btn_face(data, LBTN_DDOWN)
+            b["dleft"] = self._btn_face(data, LBTN_DLEFT)
+            b["dright"] = self._btn_face(data, LBTN_DRIGHT)
+
+            b["sl"] = self._btn_face(data, LBTN_SL)
+            b["sr"] = self._btn_face(data, LBTN_SR)
+            b["l"] = self._btn_face(data, LBTN_L)
+            b["zl"] = self._btn_face(data, LBTN_ZL)
+
+            # left optical is not used in combined (but could be later)
+            # self._handle_optical_motion(data, now)
+
+        self.btn = b
+
+    async def connect(self):
+        self.bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        self.objects = await self._get_managed_objects()
+        self.dev_path = self._find_device_path()
+
+        dev_intro = await self.bus.introspect(BLUEZ, self.dev_path)
+        dev_obj = self.bus.get_proxy_object(BLUEZ, self.dev_path, dev_intro)
+        dev = dev_obj.get_interface(DEVICE_IFACE)
+        props = dev_obj.get_interface(PROP_IFACE)
+
+        self._dev = dev
+        self._dev_props = props
+
+        await self._detect_and_configure_side(props)
+
+        try:
+            await props.call_set(DEVICE_IFACE, "Trusted", Variant("b", True))
+        except Exception:
+            pass
+
+        await dev.call_connect()
+        await self._wait_services_resolved(timeout_s=10.0)
+
+        ok = await self._refresh_objects_until_gatt(timeout_s=60.0)
+        if not ok:
+            raise RuntimeError("Connected, but notify/control characteristics never appeared.")
+        self._pick_characteristics()
+
+    async def start(self):
+        ch_intro = await self.bus.introspect(BLUEZ, self.notify_path)
+        ch_obj = self.bus.get_proxy_object(BLUEZ, self.notify_path, ch_intro)
+        self._notify_ch = ch_obj.get_interface(GATT_CHRC_IFACE)
+        self._notify_props = ch_obj.get_interface(PROP_IFACE)
+
+        ctrl_intro = await self.bus.introspect(BLUEZ, self.ctrl_path)
+        ctrl_obj = self.bus.get_proxy_object(BLUEZ, self.ctrl_path, ctrl_intro)
+        self._ctrl_ch = ctrl_obj.get_interface(GATT_CHRC_IFACE)
+
+        if not self._handler_installed:
+
+            def on_props_changed(_iface, changed, _invalidated):
+                if "Value" in changed:
+                    data = bytes(_unwrap(changed["Value"]))
+                    self.handle_notification(data)
+
+            self._notify_props.on_properties_changed(on_props_changed)
+            self._handler_installed = True
+
+        await self.ensure_notify_and_init()
+
+    async def ensure_notify_and_init(self):
+        async def safe_start_notify():
+            try:
+                await self._notify_ch.call_start_notify()
+            except Exception as ex:
+                msg = str(ex)
+                if "In Progress" not in msg and "InProgress" not in msg:
+                    raise
+
+        async def write_cmd(hexstr: str):
+            b = bytes.fromhex(hexstr)
+            opts = {"type": Variant("s", "command")}
+            await self._ctrl_ch.call_write_value(b, opts)
+
+        async def send_optical_init():
+            await write_cmd("0c91010200040000ff000000")
+            await write_cmd("0c91010400040000ff000000")
+
+        await safe_start_notify()
+        await asyncio.sleep(0.20)
+        await send_optical_init()
+
+    async def disconnect(self):
+        if self._dev is None:
+            return
+        try:
+            await self._dev.call_disconnect()
+        except Exception:
+            pass
+
+
+class _CombinedUInput:
+    def __init__(self, left_mac: str, right_mac: str, *, verbose: bool = False):
+        self.verbose = verbose
+
+        UINPUT_BUSTYPE = getattr(e, "BUS_VIRTUAL", 0x06)
+        # Xbox 360 wired controller identity (Steam/xpad-friendly)
+        UINPUT_VENDOR = 0x045E
+        UINPUT_PRODUCT = 0x028E
+        UINPUT_VERSION = 0x0001
+
+        # Combined gamepad
+        self.ui_pad = mk_uinput(
+            {
+                e.EV_KEY: [
+                    e.BTN_SOUTH, e.BTN_EAST, e.BTN_WEST, e.BTN_NORTH,
+                    e.BTN_TL, e.BTN_TR, getattr(e, "BTN_TL2", e.BTN_TL), getattr(e, "BTN_TR2", e.BTN_TR),
+                    e.BTN_SELECT, e.BTN_START, e.BTN_MODE,
+                    e.BTN_THUMBL, getattr(e, "BTN_THUMBR", e.BTN_THUMBL),
+                    e.BTN_DPAD_UP, e.BTN_DPAD_DOWN, e.BTN_DPAD_LEFT, e.BTN_DPAD_RIGHT,
+                    getattr(e, "BTN_MISC", e.BTN_MODE),
+                ],
+                e.EV_ABS: [
+                    (e.ABS_X, AbsInfo(32768, 0, 65535, 0, 512, 0)),
+                    (e.ABS_Y, AbsInfo(32768, 0, 65535, 0, 512, 0)),
+                    (getattr(e, "ABS_RX", e.ABS_X), AbsInfo(32768, 0, 65535, 0, 512, 0)),
+                    (getattr(e, "ABS_RY", e.ABS_Y), AbsInfo(32768, 0, 65535, 0, 512, 0)),
+                ],
+            },
+            name="jc2mouse (combined gamepad)",
+            bustype=UINPUT_BUSTYPE,
+            vendor=UINPUT_VENDOR,
+            product=UINPUT_PRODUCT,
+            version=UINPUT_VERSION,
+            phys=f"jc2mouse/{left_mac}+{right_mac}/combined",
+            verbose=self.verbose,
+        )
+
+        # Right-only mouse overlay (for Right C toggle)
+        self.ui_mouse = mk_uinput(
+            {
+                e.EV_REL: [
+                    e.REL_X,
+                    e.REL_Y,
+                    e.REL_WHEEL,
+                    getattr(e, "REL_WHEEL_HI_RES", e.REL_WHEEL),
+                ],
+                e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE],
+            },
+            name="jc2mouse (right mouse overlay)",
+            bustype=UINPUT_BUSTYPE,
+            vendor=0xCAFE,          # keep mouse distinct
+            product=0x4A31,
+            version=0x0001,
+            phys=f"jc2mouse/{right_mac}/mouse_overlay",
+            verbose=self.verbose,
+        )
+
+        # previous states for edge emission
+        self.prev_btn = {
+            "south": False, "east": False, "west": False, "north": False,
+            "tl": False, "tr": False, "tl2": False, "tr2": False,
+            "select": False, "start": False, "mode": False,
+            "thumbl": False, "thumbr": False,
+            "dup": False, "ddown": False, "dleft": False, "dright": False,
+            "misc": False,
+        }
+
+        self.prev_axes = {
+            "lx": 32768, "ly": 32768,
+            "rx": 32768, "ry": 32768,
+        }
+
+        self.prev_mouse = {"l": False, "r": False, "m": False}
+
+    def _emit_btn(self, keycode: int, name: str, pressed: bool) -> bool:
+        prev = bool(self.prev_btn.get(name, False))
+        pressed = bool(pressed)
+        if pressed == prev:
+            return False
+        self.ui_pad.write(e.EV_KEY, keycode, 1 if pressed else 0)
+        self.prev_btn[name] = pressed
+        return True
+
+    def _emit_axis(self, abscode: int, name: str, value: int) -> bool:
+        prev = int(self.prev_axes.get(name, 32768))
+        value = int(value)
+        if value == prev:
+            return False
+        self.ui_pad.write(e.EV_ABS, abscode, value)
+        self.prev_axes[name] = value
+        return True
+
+    def pad_syn(self):
+        self.ui_pad.syn()
+
+    def mouse_syn(self):
+        self.ui_mouse.syn()
+
+
+async def run_combined(
+    *,
+    left_mac: str,
+    right_mac: str,
+    status: bool = True,
+    status_hz: float = 5.0,
+    verbose: bool = False,
+):
+    """
+    Combined full controller:
+      - Left contributes: left stick, dpad, LB/LT, Select, L3, Capture->BTN_MISC
+      - Right contributes: ABXY, right stick, RB/RT, Start, Guide(Home), R3
+      - Right C toggles Right-only mouse overlay:
+           * Right produces mouse (optical + clicks + scroll via stick)
+           * Right gamepad contributions are suppressed
+           * Left continues to feed gamepad
+    """
+    left = _JC2Endpoint(left_mac, expected_side="left", verbose=verbose)
+    right = _JC2Endpoint(right_mac, expected_side="right", verbose=verbose)
+    ui = _CombinedUInput(left_mac=left_mac, right_mac=right_mac, verbose=verbose)
+
+    right_mouse_mode = False
+
+    # wheel accumulator for right mouse overlay
+    wheel_accum = 0.0
+
+    async def connect_with_retries(ep, label: str, *, max_attempts: int = 10, delay_s: float = 0.8):
+        """
+        Keep trying to connect/start notify without bailing out.
+        This prevents the CLI from tearing down session mode just because one side
+        wasn't held in PAIR state at the exact connect moment.
+        """
+        last_ex = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                _stderr(f"[jc2] {label.upper()}: connecting (attempt {attempt}/{max_attempts}) — hold PAIR now.")
+                await ep.connect()
+                await ep.start()
+                _stderr(f"[jc2] {label.capitalize()} connected.")
+                return
+            except Exception as ex:
+                last_ex = ex
+                s = str(ex)
+
+                # This is the common one you’re seeing.
+                if "le-connection-abort-by-local" in s or "aborted locally" in s:
+                    _stderr(f"[jc2] {label.upper()}: connect aborted — keep holding PAIR, retrying...")
+                    # Best-effort disconnect to clear BlueZ state before retrying
+                    try:
+                        await ep.disconnect()
+                    except Exception:
+                        pass
+                    await asyncio.sleep(delay_s)
+                    continue
+
+                # Some stacks throw "AlreadyConnected" variants — treat as success and proceed
+                if "Already" in s or "already" in s:
+                    try:
+                        await ep.start()
+                        _stderr(f"[jc2] {label.capitalize()} already connected; notifications started.")
+                        return
+                    except Exception:
+                        pass
+
+                # Anything else: still retry a few times, but print it once
+                _stderr(f"[jc2] {label.upper()}: connect error: {s} — retrying...")
+                try:
+                    await ep.disconnect()
+                except Exception:
+                    pass
+                await asyncio.sleep(delay_s)
+
+        raise RuntimeError(f"{label} failed to connect after {max_attempts} attempts: {last_ex}")
+
+    _stderr("[jc2] Combined mode: connecting LEFT then RIGHT.")
+    _stderr("[jc2] Hold PAIR on LEFT until it connects, then hold PAIR on RIGHT.")
+    await connect_with_retries(left, "left", max_attempts=12, delay_s=0.8)
+    await connect_with_retries(right, "right", max_attempts=12, delay_s=0.8)
+
+    _stderr("[jc2] Combined controller active.")
+    _stderr("[jc2] Tip: press C on the RIGHT Joy-Con to toggle Right-only mouse overlay.")
+
+
+    async def mouse_pump():
+        nonlocal wheel_accum
+        period = 1.0 / MOTION_HZ
+
+        DRAIN_FRACTION = 0.25
+        MIN_PER_TICK = 1.0
+        MAX_PER_TICK = float(MOTION_MAX_PER_TICK)
+
+        while True:
+            await asyncio.sleep(period)
+            now = time.time()
+
+            if not right_mouse_mode:
+                continue
+
+            ax = float(right.dx_accum)
+            ay = float(right.dy_accum)
+
+            if abs(ax) < 0.1 and abs(ay) < 0.1:
+                continue
+
+            # idle braking
+            if (now - right.last_motion_ts) > MOTION_IDLE_CUTOFF_S:
+                right.dx_accum *= MOTION_IDLE_BRAKE
+                right.dy_accum *= MOTION_IDLE_BRAKE
+                if abs(right.dx_accum) < MOTION_IDLE_ZERO:
+                    right.dx_accum = 0.0
+                if abs(right.dy_accum) < MOTION_IDLE_ZERO:
+                    right.dy_accum = 0.0
+                ax = float(right.dx_accum)
+                ay = float(right.dy_accum)
+                if abs(ax) < 0.1 and abs(ay) < 0.1:
+                    continue
+
+            mag = (ax * ax + ay * ay) ** 0.5
+            per_tick = clamp(mag * DRAIN_FRACTION, MIN_PER_TICK, MAX_PER_TICK)
+
+            if mag > 0.0:
+                out_dx = ax * (per_tick / mag)
+                out_dy = ay * (per_tick / mag)
+            else:
+                out_dx = 0.0
+                out_dy = 0.0
+
+            ix = int(round(out_dx))
+            iy = int(round(out_dy))
+            if ix == 0 and iy == 0:
+                continue
+
+            ui.ui_mouse.write(e.EV_REL, e.REL_X, ix)
+            ui.ui_mouse.write(e.EV_REL, e.REL_Y, iy)
+            ui.mouse_syn()
+
+            right.dx_accum -= ix
+            right.dy_accum -= iy
+
+    async def emit_loop():
+        nonlocal right_mouse_mode, wheel_accum
+
+        period = 1.0 / 120.0
+        last_print = 0.0
+        last_l_cnt = 0
+        last_r_cnt = 0
+        status_period = 1.0 / max(0.5, float(status_hz))
+
+        ABS_RX = getattr(e, "ABS_RX", e.ABS_X)
+        ABS_RY = getattr(e, "ABS_RY", e.ABS_Y)
+        BTN_TL2 = getattr(e, "BTN_TL2", e.BTN_TL)
+        BTN_TR2 = getattr(e, "BTN_TR2", e.BTN_TR)
+        BTN_THUMBR = getattr(e, "BTN_THUMBR", e.BTN_THUMBL)
+        BTN_MISC = getattr(e, "BTN_MISC", e.BTN_MODE)
+
+        # Combined mode is VERTICAL orientation.
+        # Face buttons should be Xbox positional:
+        #   South=A, East=B, West=X, North=Y
+        #
+        # Right Joy-Con letters in vertical orientation:
+        #   a = east, b = south, x = north, y = west
+        #
+        # Therefore:
+        #   gp_south(A) = b
+        #   gp_east (B) = a
+        #   gp_west (X) = y
+        #   gp_north(Y) = x
+        COMPAT_SWAP_SOUTH_EAST = False
+        COMPAT_SWAP_WEST_NORTH = True  # set True only if Steam shows X/Y swapped
+
+        while True:
+            await asyncio.sleep(period)
+            now = time.time()
+
+            pad_dirty = False
+
+            # Right C toggles right-only mouse overlay
+            if right.c_edge:
+                right.c_edge = False
+                right_mouse_mode = not right_mouse_mode
+                _stderr(f"[jc2] Right mouse overlay: {'ON' if right_mouse_mode else 'OFF'}")
+
+                if right_mouse_mode:
+                    # Ensure notifications + optical init are active for mouse overlay
+                    try:
+                        await right.ensure_notify_and_init()
+                    except Exception:
+                        pass
+
+                    # Reset optical baselines so first delta isn't junk
+                    right.prev_x16 = None
+                    right.prev_y16 = None
+                    right.dx_accum = 0.0
+                    right.dy_accum = 0.0
+
+                    # Release right-side gamepad contributions (avoid stuck)
+                    pad_dirty |= ui._emit_btn(e.BTN_SOUTH, "south", False)
+                    pad_dirty |= ui._emit_btn(e.BTN_EAST,  "east",  False)
+                    pad_dirty |= ui._emit_btn(e.BTN_WEST,  "west",  False)
+                    pad_dirty |= ui._emit_btn(e.BTN_NORTH, "north", False)
+                    pad_dirty |= ui._emit_btn(e.BTN_TR,    "tr",    False)
+                    pad_dirty |= ui._emit_btn(BTN_TR2,     "tr2",   False)
+                    pad_dirty |= ui._emit_btn(e.BTN_START, "start", False)
+                    pad_dirty |= ui._emit_btn(e.BTN_MODE,  "mode",  False)
+                    pad_dirty |= ui._emit_btn(BTN_THUMBR,  "thumbr", False)
+                    pad_dirty |= ui._emit_axis(ABS_RX,     "rx",    32768)
+                    pad_dirty |= ui._emit_axis(ABS_RY,     "ry",    32768)
+
+            # ===== LEFT contribution (always active) =====
+            lb = bool(left.btn.get("l", False))
+            lt = bool(left.btn.get("zl", False))
+            select = bool(left.btn.get("minus", False))
+            l3 = bool(left.btn.get("l3", False))
+            capture = bool(left.btn.get("capture", False))
+
+            pad_dirty |= ui._emit_btn(e.BTN_TL,     "tl",     lb)
+            pad_dirty |= ui._emit_btn(BTN_TL2,      "tl2",    lt)
+            pad_dirty |= ui._emit_btn(e.BTN_SELECT, "select", select)
+            pad_dirty |= ui._emit_btn(e.BTN_THUMBL, "thumbl", l3)
+            pad_dirty |= ui._emit_btn(BTN_MISC,     "misc",   capture)
+
+            # Combined mode is VERTICAL orientation: direct dpad mapping
+            pad_dirty |= ui._emit_btn(e.BTN_DPAD_UP,    "dup",    bool(left.btn.get("dup", False)))
+            pad_dirty |= ui._emit_btn(e.BTN_DPAD_RIGHT, "dright", bool(left.btn.get("dright", False)))
+            pad_dirty |= ui._emit_btn(e.BTN_DPAD_DOWN,  "ddown",  bool(left.btn.get("ddown", False)))
+            pad_dirty |= ui._emit_btn(e.BTN_DPAD_LEFT,  "dleft",  bool(left.btn.get("dleft", False)))
+
+            # Left stick -> ABS_X/ABS_Y (NO rotation in combined mode)
+            if left._stick_center_x12 is not None and left._stick_center_y12 is not None:
+                dx = left.last_stick_x12 - left._stick_center_x12
+                dy = left.last_stick_y12 - left._stick_center_y12  # down positive
+
+
+                if abs(dx) <= STICK_DEADZONE_12:
+                    dx = 0
+                if abs(dy) <= STICK_DEADZONE_12:
+                    dy = 0
+
+                dx = int(clamp(dx, -2048, 2048))
+                dy = int(clamp(dy, -2048, 2048))
+
+                ax, ay = _abs_from_rxry(dx, dy)
+                pad_dirty |= ui._emit_axis(e.ABS_X, "lx", ax)
+                pad_dirty |= ui._emit_axis(e.ABS_Y, "ly", ay)
+
+            # ===== RIGHT contribution (only when NOT in right-mouse mode) =====
+            if not right_mouse_mode:
+                a = bool(right.btn.get("a", False))  # Joy-Con A (east)
+                b = bool(right.btn.get("b", False))  # Joy-Con B (south)
+                x = bool(right.btn.get("x", False))  # Joy-Con X (north)
+                y = bool(right.btn.get("y", False))  # Joy-Con Y (west)
+
+                rb = bool(right.btn.get("r", False))
+                rt = bool(right.btn.get("zr", False))
+                start = bool(right.btn.get("plus", False))
+                guide = bool(right.btn.get("home", False))
+                r3 = bool(right.btn.get("r3", False))
+
+                # Xbox positional face mapping (vertical)
+                gp_south = b   # A
+                gp_east  = a   # B
+                gp_west  = y   # X
+                gp_north = x   # Y
+
+                if COMPAT_SWAP_SOUTH_EAST:
+                    gp_south, gp_east = gp_east, gp_south
+                if COMPAT_SWAP_WEST_NORTH:
+                    gp_west, gp_north = gp_north, gp_west
+
+                pad_dirty |= ui._emit_btn(e.BTN_SOUTH, "south", gp_south)
+                pad_dirty |= ui._emit_btn(e.BTN_EAST,  "east",  gp_east)
+                pad_dirty |= ui._emit_btn(e.BTN_WEST,  "west",  gp_west)
+                pad_dirty |= ui._emit_btn(e.BTN_NORTH, "north", gp_north)
+
+                pad_dirty |= ui._emit_btn(e.BTN_TR,    "tr",    rb)   # RB
+                pad_dirty |= ui._emit_btn(BTN_TR2,     "tr2",   rt)   # RT
+                pad_dirty |= ui._emit_btn(e.BTN_START, "start", start)
+                pad_dirty |= ui._emit_btn(e.BTN_MODE,  "mode",  guide)
+                pad_dirty |= ui._emit_btn(BTN_THUMBR,  "thumbr", r3)
+
+                # Right stick -> ABS_RX/ABS_RY (NO rotation in combined mode)
+                if right._stick_center_x12 is not None and right._stick_center_y12 is not None:
+                    dx = right.last_stick_x12 - right._stick_center_x12
+                    dy = right.last_stick_y12 - right._stick_center_y12  # down positive
+
+                    if abs(dx) <= STICK_DEADZONE_12:
+                        dx = 0
+                    if abs(dy) <= STICK_DEADZONE_12:
+                        dy = 0
+
+                    dx = int(clamp(dx, -2048, 2048))
+                    dy = int(clamp(dy, -2048, 2048))
+
+                    ax, ay = _abs_from_rxry(dx, dy)
+                    pad_dirty |= ui._emit_axis(ABS_RX, "rx", ax)
+                    pad_dirty |= ui._emit_axis(ABS_RY, "ry", ay)
+
+            # Flush pad writes every tick where anything changed (fixes "laggy left" during mouse overlay)
+            if pad_dirty:
+                ui.pad_syn()
+
+            # ===== RIGHT mouse overlay (only when ON) =====
+            if right_mouse_mode:
+                # clicks
+                lclk = bool(right.btn.get("r", False))
+                rclk = bool(right.btn.get("zr", False))
+                mclk = bool(right.btn.get("r3", False))
+
+                if lclk != ui.prev_mouse["l"]:
+                    ui.ui_mouse.write(e.EV_KEY, e.BTN_LEFT, 1 if lclk else 0)
+                    ui.prev_mouse["l"] = lclk
+                if rclk != ui.prev_mouse["r"]:
+                    ui.ui_mouse.write(e.EV_KEY, e.BTN_RIGHT, 1 if rclk else 0)
+                    ui.prev_mouse["r"] = rclk
+                if mclk != ui.prev_mouse["m"]:
+                    ui.ui_mouse.write(e.EV_KEY, e.BTN_MIDDLE, 1 if mclk else 0)
+                    ui.prev_mouse["m"] = mclk
+
+                # scroll via right stick Y deflection (simple)
+                if right._stick_center_y12 is not None:
+                    dy = right.last_stick_y12 - right._stick_center_y12
+                    if abs(dy) > STICK_DEADZONE_12:
+                        mag = min(abs(dy), 2048)
+                        norm = clamp((mag - STICK_DEADZONE_12) / max(1.0, (2048 - STICK_DEADZONE_12)), 0.0, 1.0)
+                        speed_lines_per_sec = (norm ** SCROLL_CURVE_POWER) * SCROLL_MAX_LINES_PER_SEC
+                        direction = 1.0 if dy > 0 else -1.0
+                        wheel_accum += direction * speed_lines_per_sec * (1.0 / 40.0)
+
+                        step = int(clamp(wheel_accum, -SCROLL_MAX_STEP, SCROLL_MAX_STEP))
+                        if step != 0:
+                            ui.ui_mouse.write(e.EV_REL, e.REL_WHEEL, step)
+                            wheel_accum -= step
+
+                ui.mouse_syn()
+
+            # status line
+            if status and (now - last_print) >= status_period:
+                last_print = now
+                lcnt = left.notif_count
+                rcnt = right.notif_count
+                lrate = (lcnt - last_l_cnt) / max(1e-6, status_period)
+                rrate = (rcnt - last_r_cnt) / max(1e-6, status_period)
+                last_l_cnt = lcnt
+                last_r_cnt = rcnt
+
+                sys.stderr.write(
+                    f"\r[jc2] COMBINED rm={'1' if right_mouse_mode else '0'} "
+                    f"Lnotifs={lcnt:5d} ({lrate:4.0f}/s) Rnotifs={rcnt:5d} ({rrate:4.0f}/s)   "
+                )
+                sys.stderr.flush()
+
+
+    pump_task = asyncio.create_task(mouse_pump())
+    emit_task = asyncio.create_task(emit_loop())
+
+    try:
+        await asyncio.gather(pump_task, emit_task)
+    finally:
+        # best-effort release
+        try:
+            ui.ui_mouse.write(e.EV_KEY, e.BTN_LEFT, 0)
+            ui.ui_mouse.write(e.EV_KEY, e.BTN_RIGHT, 0)
+            ui.ui_mouse.write(e.EV_KEY, e.BTN_MIDDLE, 0)
+            ui.mouse_syn()
+        except Exception:
+            pass
+
+        try:
+            await left.disconnect()
+        except Exception:
+            pass
+        try:
+            await right.disconnect()
+        except Exception:
+            pass

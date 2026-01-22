@@ -13,7 +13,7 @@ from dbus_next.aio import MessageBus
 from dbus_next.constants import BusType
 from dbus_next.errors import DBusError
 
-from jc2mouse.driver import run as run_driver
+from jc2mouse.driver import run as run_driver, run_combined
 from jc2mouse.mapper import run_button_wizard
 
 BLUEZ = "org.bluez"
@@ -444,7 +444,64 @@ def main():
             nonlocal started_session, chosen_mac, chosen_side
 
             if args.combined:
-                raise SystemExit("ERROR: --combined is not implemented yet (next milestone).")
+                # session handling
+                try:
+                    started_session = _ensure_session(args.session)
+                except Exception as ex:
+                    raise SystemExit(f"ERROR: failed to enter session mode: {ex}")
+
+                # Combined requires BOTH Joy-Cons.
+                # We always pick one LEFT and one RIGHT (side is detected via ManufacturerData).
+                if not args.auto:
+                    raise SystemExit("ERROR: combined mode currently requires --auto (it will auto-pick left+right).")
+
+                prefer_connected = not args.no_prefer_connected
+
+                sys.stderr.write("[jc2] Combined mode: we will pick LEFT then RIGHT.\n")
+                sys.stderr.write("[jc2] Hold PAIR on the LEFT Joy-Con first until it appears.\n")
+                sys.stderr.write("[jc2] Tip: avoid pressing other buttons while it’s connecting.\n")
+                sys.stderr.flush()
+
+                pick_l, live_l, _ = await discover_jc2(
+                    timeout_s=args.timeout,
+                    side_filter="left",
+                    prefer_connected=prefer_connected,
+                )
+                if not pick_l:
+                    raise SystemExit("ERROR: could not find a LEFT Joy-Con 2 (no LIVE advertisers found).")
+
+                left_mac = pick_l["mac"]
+                sys.stderr.write(f"[jc2] Picked LEFT  {left_mac} (rssi={pick_l.get('rssi')})\n")
+                sys.stderr.write("[jc2] Now hold PAIR on the RIGHT Joy-Con.\n")
+                sys.stderr.flush()
+
+                pick_r, live_r, _ = await discover_jc2(
+                    timeout_s=args.timeout,
+                    side_filter="right",
+                    prefer_connected=prefer_connected,
+                )
+                if not pick_r:
+                    raise SystemExit("ERROR: could not find a RIGHT Joy-Con 2 (no LIVE advertisers found).")
+
+                right_mac = pick_r["mac"]
+                sys.stderr.write(f"[jc2] Picked RIGHT {right_mac} (rssi={pick_r.get('rssi')})\n")
+                sys.stderr.flush()
+
+                # Run combined controller
+                try:
+                    await run_combined(
+                        left_mac=left_mac,
+                        right_mac=right_mac,
+                        status=(not args.no_status),
+                        status_hz=args.status_hz,
+                        verbose=args.verbose,
+                    )
+                except Exception as ex:
+                    # nicer error on the common BLE abort
+                    raise SystemExit(_friendly_connect_error(ex))
+
+                return
+
 
             # session handling
             try:

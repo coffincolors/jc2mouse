@@ -60,7 +60,7 @@ apply_patch_force_medium() {
   #   else
   #       sec_level = BT_IO_SEC_MEDIUM;
   #
-  # This assumes BlueZ 5.72 uses that structure (it does, per your grep).
+  # This assumes BlueZ 5.72 uses that structure.
 
   perl -0777 -i -pe '
     s/if\s*\(\s*dev->le_state\.paired\s*\)\s*\n\s*sec_level\s*=\s*BT_IO_SEC_MEDIUM\s*;\s*\n\s*else\s*\n\s*sec_level\s*=\s*BT_IO_SEC_LOW\s*;/
@@ -111,7 +111,7 @@ apply_patch_ignore_secondary_timeout() {
       $1 . "if (att_ecode == 0x00)\n\t\tgoto next;\n"/se
   ' "$f"
 
-  # Quick sanity check
+  # Quick check
   if ! grep -n "att_ecode == 0x00" "$f" >/dev/null; then
     echo "[bluez] ERROR: secondary timeout ignore patch did not apply" >&2
     exit 4

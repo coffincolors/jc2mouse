@@ -337,18 +337,6 @@ If a Joy-Con enters mouse mode but optical data does not become active immediate
 
 ---
 
-## Development notes
-
-Useful local commands:
-
-```bash
-git status
-git add README.md scripts/setup.sh scripts/build_bluez.sh src/jc2mouse/cli.py src/jc2mouse/driver.py src/jc2mouse/ns2pro.py .gitignore
-git commit -m "Add Switch 2 Pro support and refresh CLI/session docs"
-```
-
----
-
 ## License
 
 See repository license / project preferences.

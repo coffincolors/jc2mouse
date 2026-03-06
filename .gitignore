@@ -1,10 +1,25 @@
+# Python
 __pycache__/
 *.pyc
+
+# Local virtualenv
 .venv/
-dist/
-build/
-*.egg-info/
-*.log
-/tmp/
+
+# Local test/debug artifacts
+debug/
+local_archive/
+*.current
+*.old
+log.txt
+dbus-*.log
+newkernel-*.log
+oldkernel-*.log
+patched-*.log
+
+# Temporary odd files
+--noplugin=autopair
+
+# Local experimental files
+*.testing
 bluez-src/
-bluez-build/
+*.egg-info/

@@ -1,108 +1,103 @@
-# jc2mouse — Joy-Con 2 mouse + controller (bondless / no pairing)
+# jc2mouse
 
-`jc2mouse` is a Linux userspace tool that connects to Nintendo Switch 2 Joy-Con 2 controllers over BLE **without pairing/bonding**, enables the optical sensor stream, and exposes virtual input devices via **uinput**.
+`jc2mouse` is a Linux userspace tool for using **Nintendo Switch 2 Joy-Con 2 controllers** and the **Nintendo Switch 2 Pro Controller** over BLE, with support for **bondless / no-pairing workflows**.
 
-It supports:
-- **Single Joy-Con mode**: mouse + compact gamepad mode
-- **Combined mode (Left + Right)**: one full virtual Xbox-style controller
-- **Mouse overlay in combined mode**: press **C** on the Right Joy-Con to turn *only the Right Joy-Con* into a mouse while the Left Joy-Con continues as the left half of the gamepad
+It currently supports:
+
+- **Single Joy-Con 2 mode**
+  - mouse mode
+  - compact gamepad mode
+- **Combined Joy-Con 2 mode**
+  - Left + Right as one full virtual controller
+  - optional **right-side mouse overlay**
+- **Nintendo Switch 2 Pro Controller mode**
+  - full gamepad via uinput
 
 ---
 
-## Why “session mode” is required
+## Current state of BlueZ / session mode
 
-Joy-Con 2 will disconnect if Linux/BlueZ tries to enforce normal pairing/security behavior for LE connections.
+Originally, this project depended on a **patched BlueZ session-mode workflow** to work around BLE / GATT behavior seen on some systems.
 
-This repo uses a patched `bluetoothd` in a safe, reversible **session mode**:
-- stop `bluetooth.service`
-- start `jc2-bluetooth.service` (patched bluetoothd)
-- run `jc2mouse`
-- restore stock Bluetooth on exit
+On newer systems, **stock BlueZ may already work well enough** for jc2mouse without needing the patched session daemon.
 
-The session swap is controlled by a helper script installed as:
-- `/usr/local/sbin/jc2-session`
+Because of that, the project now treats patched BlueZ as:
+
+- an **optional fallback**
+- a **troubleshooting path**
+- a way to test behavior against a custom BlueZ build when stock behavior is unreliable
+
+So the normal recommendation is:
+
+1. **Try jc2mouse with your stock Bluetooth stack first**
+2. If your controller still drops, fails to enumerate correctly, or behaves inconsistently, then try the **patched BlueZ session mode**
 
 ---
 
 ## Features
 
-### Single Joy-Con mode
+### 1) Single Joy-Con 2 mode
 
-**Right Joy-Con 2**
-- Mouse: optical motion -> `REL_X/REL_Y`
-- Clicks: (default) R = left click, ZR = right click, R3 = middle click
-- Scroll: stick Y deflection (smooth)
-- Toggle mouse/gamepad: **C**
+#### Right Joy-Con 2
 
-**Left Joy-Con 2**
-- Mouse (optional): optical + clicks + stick scroll
-- Toggle mouse/gamepad: **hold L + ZL**
-- Gamepad mode uses an Xbox-style mapping (Steam/xpad compat handled)
+- Optical mouse motion
+- Mouse buttons from controller buttons
+- Stick-based scroll
+- Toggle mouse/gamepad mode with **C**
 
-### Combined mode (Left + Right)
+#### Left Joy-Con 2
 
-- One virtual **Xbox-style** uinput controller:
-  - Left stick -> `ABS_X/ABS_Y`
-  - Right stick -> `ABS_RX/ABS_RY`
-  - D-pad -> `BTN_DPAD_*`
-  - ABXY -> Xbox positions (South=A, East=B, West=X, North=Y)
-  - LB/LT from Left, RB/RT from Right
-  - Start/Select/Guide mapped sensibly
-- **Right mouse overlay in combined mode**
-  - Press **C** on the Right Joy-Con:
-    - Right becomes mouse (optical + buttons + scroll)
-    - Right half of the gamepad is suppressed
-    - Left continues driving the left half of the combined controller
-  - Press **C** again to return to full combined controller
+- Optical mouse motion
+- Mouse buttons from controller buttons
+- Stick-based scroll
+- Toggle mouse/gamepad mode with **hold L + ZL**
 
----
+### 2) Combined Joy-Con 2 mode
 
-## Repository layout (high level)
+- Left + Right exposed as one full virtual gamepad
+- Xbox-style face-button layout for better Linux / Steam compatibility
+- Right stick, left stick, shoulders, triggers, d-pad, etc.
+- **Right-only mouse overlay**:
+  - press **C** on the Right Joy-Con
+  - Right side becomes mouse
+  - Left side continues as the left half of the controller
 
-- `src/jc2mouse/driver.py` — BLE (BlueZ D-Bus) + optical + uinput logic
-- `src/jc2mouse/cli.py` — CLI entrypoint + auto discovery + session integration
-- `scripts/build_bluez.sh` — builds patched BlueZ bluetoothd into `/opt/jc2mouse/bluez`
-- `scripts/setup.sh` — installs systemd unit + session helper
-- `scripts/jc2-session.sh` — start/stop/status session mode
-- `systemd/jc2-bluetooth.service` — systemd unit for patched bluetoothd
+### 3) Nintendo Switch 2 Pro Controller
+
+- Auto-detected from the main CLI when supported advertisements are visible
+- Exposed as a full virtual gamepad
+- Can also be run directly through the dedicated ns2pro path if needed
 
 ---
 
-## Setup
+## Repository layout
 
-### 1) Install the systemd unit + session helper
+- `src/jc2mouse/cli.py` — CLI, discovery, session handling
+- `src/jc2mouse/driver.py` — Joy-Con 2 driver logic
+- `src/jc2mouse/ns2pro.py` — Switch 2 Pro Controller driver
+- `src/jc2mouse/mapper.py` — developer button-mapping helper
+- `scripts/setup.sh` — installs helper/service files
+- `scripts/jc2-session.sh` — session-mode helper
+- `scripts/build_bluez.sh` — optional patched BlueZ build/install script
+- `systemd/jc2-bluetooth.service` — optional patched session-mode bluetoothd unit
 
-This installs:
-- `/etc/systemd/system/jc2-bluetooth.service`
-- `/usr/local/sbin/jc2-session`
+---
 
-Run:
+## Requirements
 
-```bash
-sudo scripts/setup.sh
-```
+- Linux
+- Python 3.10+ recommended
+- root privileges for uinput / Bluetooth control
+- working BlueZ / D-Bus environment
+- `uinput` available
 
-### 2) Build and install patched bluetoothd
+---
 
-Build script downloads BlueZ (default 5.72), applies patches, and installs into:
+## Installation
 
-- `/opt/jc2mouse/bluez`
+### 1) Python environment
 
-Run:
-
-```bash
-sudo scripts/build_bluez.sh
-```
-
-The `jc2-bluetooth.service` unit uses:
-
-```text
-ExecStart=/opt/jc2mouse/bluez/libexec/bluetooth/bluetoothd -E -n -d
-```
-
-### 3) Python install (venv recommended)
-
-From repo root:
+From the repo root:
 
 ```bash
 python3 -m venv .venv
@@ -111,99 +106,249 @@ pip install -U pip
 pip install -e .
 ```
 
+### 2) Install the helper/service files
+
+```bash
+sudo scripts/setup.sh
+```
+
+This installs:
+
+- `/usr/local/sbin/jc2-session`
+- `/etc/systemd/system/jc2-bluetooth.service`
+
+Note: installing these files does **not** force you to use patched BlueZ. It just prepares the optional fallback path.
+
+### 3) Optional: build patched BlueZ
+
+Only do this if stock Bluetooth is unreliable on your system, or if you want to test the custom session-mode path.
+
+```bash
+sudo scripts/build_bluez.sh
+```
+
+This installs a patched bluetoothd under:
+
+```text
+/opt/jc2mouse/bluez
+```
+
 ---
 
-## Usage
+## Basic usage
 
-### Session mode
+### Show CLI help
+
+```bash
+jc2mouse --help
+jc2mouse run --help
+jc2mouse scan --help
+```
+
+If using a virtualenv under sudo:
+
+```bash
+sudo -E .venv/bin/jc2mouse --help
+```
+
+---
+
+## Running with stock Bluetooth first
+
+This is now the recommended first test.
+
+### Auto-detect and run a single controller
+
+```bash
+sudo -E .venv/bin/jc2mouse run --auto --session off
+```
+
+### Auto-detect combined Joy-Con mode
+
+```bash
+sudo -E .venv/bin/jc2mouse run --auto --combined --session off
+```
+
+### Filter Joy-Con side
+
+```bash
+sudo -E .venv/bin/jc2mouse run --auto --side left --session off
+sudo -E .venv/bin/jc2mouse run --auto --side right --session off
+```
+
+### Verbose mode
+
+```bash
+sudo -E .venv/bin/jc2mouse run --auto --verbose --session off
+```
+
+### Logging to a file
+
+```bash
+sudo -E .venv/bin/jc2mouse run --auto --verbose --session off 2>&1 | tee debug/jc2mouse.log
+```
+
+---
+
+## Optional patched BlueZ session mode
+
+If stock Bluetooth is unstable, try session mode.
+
+### Start the patched session manually
 
 ```bash
 sudo jc2-session start
+```
+
+### Check status
+
+```bash
 sudo jc2-session status
+```
+
+### Stop the patched session
+
+```bash
 sudo jc2-session stop
 ```
 
-### Running with a venv + sudo
-
-`sudo` usually won’t see your venv PATH. Use one of these patterns:
-
-**A) Explicit venv path**
-```bash
-sudo -E .venv/bin/jc2mouse run --auto
-```
-
-**B) Use `which` while the venv is activated**
-```bash
-sudo -E "$(which jc2mouse)" run --auto
-```
-
-### Single Joy-Con (auto)
+### Run jc2mouse with session mode auto-handling
 
 ```bash
 sudo -E .venv/bin/jc2mouse run --auto
 ```
 
-Filter by side:
+The default `--session auto` behavior will attempt to use the optional session helper path when appropriate.
+
+If you explicitly want to avoid any session changes:
 
 ```bash
-sudo -E .venv/bin/jc2mouse run --auto --side left
-sudo -E .venv/bin/jc2mouse run --auto --side right
+sudo -E .venv/bin/jc2mouse run --auto --session off
 ```
 
-### Combined mode (full controller)
+---
+
+## Common examples
+
+### Single Joy-Con 2
 
 ```bash
-sudo -E .venv/bin/jc2mouse run --auto --combined
+sudo -E .venv/bin/jc2mouse run --auto --session off
 ```
 
-Tips:
-- Hold **PAIR** on Left until it connects, then hold **PAIR** on Right.
-- Some systems require a retry or two due to unpaired BLE timing.
+### Combined Joy-Con 2 controller
+
+```bash
+sudo -E .venv/bin/jc2mouse run --auto --combined --session off
+```
+
+### Scan only
+
+```bash
+sudo -E .venv/bin/jc2mouse scan --timeout 8
+```
+
+### Switch 2 Pro Controller via main auto path
+
+```bash
+sudo -E .venv/bin/jc2mouse run --auto --session off
+```
+
+If the advertised device is recognized as an NS2 Pro controller, the CLI will route into the `ns2pro` driver path automatically.
+
+### Dedicated ns2pro path
+
+```bash
+sudo -E .venv/bin/jc2mouse ns2pro --mac 38:C6:CE:29:60:44 --session off
+```
+
+---
+
+## Stopping the app
+
+Press:
+
+```text
+Ctrl+C
+```
+
+The CLI will stop cleanly.
+
+If you also want the controller disconnected on exit, use:
+
+```bash
+--disconnect-on-exit
+```
+
+Examples:
+
+```bash
+sudo -E .venv/bin/jc2mouse run --auto --session off --disconnect-on-exit
+sudo -E .venv/bin/jc2mouse run --auto --combined --session off --disconnect-on-exit
+```
 
 ---
 
 ## Troubleshooting
 
-### “Bluetooth LE connection was aborted locally” / `le-connection-abort-by-local`
+### 1) Stock works, but `--session auto` fails
 
-Usually means the Joy-Con wasn’t connectable at the moment BlueZ attempted the connect.
+If session mode is failing but stock Bluetooth works, just run with:
 
-Try:
-1) Hold the **PAIR** button during the connection attempt.
-2) Don’t press other buttons while connecting.
-3) Retry the command; combined mode may need a retry for the second Joy-Con.
+```bash
+--session off
+```
 
-### `bluetooth.service` is masked
+Then inspect:
 
-If stock Bluetooth is masked, session restore may fail.
+```bash
+systemctl status jc2-bluetooth.service --no-pager -l
+journalctl -u jc2-bluetooth.service -n 100 --no-pager
+```
 
-Fix:
+### 2) bluetooth.service is masked
 
 ```bash
 sudo systemctl unmask bluetooth.service
 sudo systemctl enable --now bluetooth.service
 ```
 
-### Service sanity checks
+### 3) Controller not found
+
+- hold the controller **PAIR** button
+- avoid pressing other buttons while it is connecting
+- try `scan` first
+- use `--ask` if multiple compatible devices are advertising
+
+### 4) Combined mode can require another attempt
+
+On some systems, if the first Joy-Con falls out of pairing state before the second side is ready, you may need to press **PAIR** again on the side that dropped.
+
+### 5) Optical init can sometimes stay idle
+
+If a Joy-Con enters mouse mode but optical data does not become active immediately, re-run and try again. This is known to occasionally happen during bring-up and is not always a permanent failure.
+
+---
+
+## Notes
+
+- This project name started from the Joy-Con 2 mouse workflow, but it now also supports broader Nintendo Switch 2 controller use cases.
+- The optional patched BlueZ path is still kept in the repo because it remains useful for regression testing and for systems where stock behavior is not sufficient.
+
+---
+
+## Development notes
+
+Useful local commands:
 
 ```bash
-systemctl status jc2-bluetooth.service --no-pager
-systemctl status bluetooth.service --no-pager
+git status
+git add README.md scripts/setup.sh scripts/build_bluez.sh src/jc2mouse/cli.py src/jc2mouse/driver.py src/jc2mouse/ns2pro.py .gitignore
+git commit -m "Add Switch 2 Pro support and refresh CLI/session docs"
 ```
 
 ---
 
-## Roadmap / QoL
+## License
 
-- LED management (player LEDs / mode indicator)
-- GUI frontend (mode notifications / smoother UX)
-- IMU decode (gyro + accel) and DualShock/DualSense-style emulation mode
-- Battery level reporting (investigate feasibility without bonding)
-- Rumble
-- Windows port + Android/Winlator Cmod integration
-
----
-
-## License / Contributions
-
-Open to contributions and issue reports. Please include logs and device info (distro, kernel, BlueZ version) when reporting bugs.
+See repository license / project preferences.

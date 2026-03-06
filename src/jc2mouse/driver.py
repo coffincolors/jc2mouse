@@ -63,13 +63,6 @@ JC2_SIDE_BYTE_IDX = 5
 JC2_SIDE_RIGHT = 0x66
 JC2_SIDE_LEFT = 0x67
 
-# Button byte indices differ between Right vs Left JC2 packets
-RIGHT_BTN_FACE_IDX = 4   # ABXY/SR/SL/L/ZL live here on Right
-RIGHT_BTN_MISC_IDX = 5   # PLUS/R3/HOME/C live here on Right
-
-LEFT_BTN_MISC_IDX = 5    # MINUS/L3/CAPTURE live here on Left
-LEFT_BTN_FACE_IDX = 6    # DPAD/SL/SR/L/ZL live here on Left
-
 # ---- Joy-Con 2 known GATT UUIDs ----
 DEFAULT_NOTIFY_UUID = "ab7de9be-89fe-49ad-828f-118f09df7fd2"
 DEFAULT_CTRL_UUID = "649d4ac9-8eb7-4e6c-af44-1ea54fe5f005"
@@ -321,6 +314,12 @@ class JC2OpticalMouse:
         self._dev = None
         self._dev_props = None
 
+        self._dev_connected: bool | None = None
+        self._dev_services_resolved: bool | None = None
+        self._dev_paired: bool | None = None
+        self._dev_bonded: bool | None = None
+        self._dev_state_trace_installed = False
+
         # ---- Virtual input devices (uinput) ----
         #
         # IMPORTANT:
@@ -379,7 +378,43 @@ class JC2OpticalMouse:
             verbose=self.verbose,
         )
 
+    def _install_dev_state_trace(self, dev_props) -> None:
+        """
+        Verbose-only: correlate our timeline with bluetoothd.
+        Logs key Device1 property transitions (Connected/ServicesResolved/Paired/Bonded).
+        Safe to call multiple times; installs only once.
+        """
+        if self._dev_state_trace_installed:
+            return
 
+        self._dev_state_trace_installed = True
+
+        if not self.verbose:
+            return
+
+        def _ts() -> str:
+            return time.strftime("%H:%M:%S")
+
+        def on_dev_props_changed(_iface, changed, _invalidated):
+            # changed is a dict[str, Variant]
+            keys = ("Connected", "ServicesResolved", "Paired", "Bonded")
+            any_hit = False
+            parts = []
+            for k in keys:
+                if k in changed:
+                    any_hit = True
+                    try:
+                        parts.append(f"{k}={_unwrap(changed[k])}")
+                    except Exception:
+                        parts.append(f"{k}=?")
+            if any_hit:
+                _stderr(f"[jc2][dbg] devprops {_ts()} " + " ".join(parts))
+
+        try:
+            dev_props.on_properties_changed(on_dev_props_changed)
+        except Exception:
+            # never let tracing break bring-up
+            pass
 
     async def _get_managed_objects(self):
         intro = await self.bus.introspect(BLUEZ, "/")
@@ -422,24 +457,131 @@ class JC2OpticalMouse:
         self.notify_path = notify_path
         self.ctrl_path = ctrl_path
 
-    async def _wait_services_resolved(self, timeout_s: float = 8.0) -> None:
+    def _try_pick_characteristics(self) -> bool:
+        """
+        Non-throwing version of _pick_characteristics().
+        Returns True once both notify/control characteristic paths are present.
+        """
+        notify_path = None
+        ctrl_path = None
+
+        for path, ifaces in self.objects.items():
+            ch = ifaces.get(GATT_CHRC_IFACE)
+            if not ch:
+                continue
+            if self.dev_path and not path.startswith(self.dev_path + "/"):
+                continue
+
+            uuid = str(_unwrap(ch.get("UUID", "")) or "").lower()
+            if uuid == self.notify_uuid:
+                notify_path = path
+            if uuid == self.ctrl_uuid:
+                ctrl_path = path
+
+        if notify_path and ctrl_path:
+            self.notify_path = notify_path
+            self.ctrl_path = ctrl_path
+            return True
+
+        return False
+
+    async def _wait_usable_gatt_state(self, timeout_s: float = 15.0) -> None:
+        """
+        Wait until the device is in a usable GATT state.
+
+        Accept *either*:
+          A) Device1.ServicesResolved == True
+          B) notify/control characteristics appear in the BlueZ object tree
+
+        Also bail early if BlueZ reports Connected=False while we wait.
+        """
+        if self.bus is None or self.dev_path is None:
+            raise RuntimeError("Driver not connected to bus or missing dev_path")
+
         dev_intro = await self.bus.introspect(BLUEZ, self.dev_path)
         dev_obj = self.bus.get_proxy_object(BLUEZ, self.dev_path, dev_intro)
-        props = dev_obj.get_interface("org.freedesktop.DBus.Properties")
+        dev_props = dev_obj.get_interface(PROP_IFACE)
+
+        # Shared state updated by PropertiesChanged
+        state = {
+            "connected": None,          # None/True/False
+            "services_resolved": None,  # None/True/False
+        }
+
+        def on_dev_props_changed(_iface, changed, _invalidated):
+            if "Connected" in changed:
+                try:
+                    state["connected"] = bool(_unwrap(changed["Connected"]))
+                except Exception:
+                    pass
+            if "ServicesResolved" in changed:
+                try:
+                    state["services_resolved"] = bool(_unwrap(changed["ServicesResolved"]))
+                except Exception:
+                    pass
+
+        dev_props.on_properties_changed(on_dev_props_changed)
+
+        # Prime with current values (best effort)
+        try:
+            v = await dev_props.call_get(DEVICE_IFACE, "Connected")
+            state["connected"] = bool(_unwrap(v))
+        except Exception:
+            pass
+        try:
+            v = await dev_props.call_get(DEVICE_IFACE, "ServicesResolved")
+            state["services_resolved"] = bool(_unwrap(v))
+        except Exception:
+            pass
 
         deadline = time.time() + timeout_s
+
+        # If already resolved, we're done
+        if state["services_resolved"] is True:
+            return
+
+        # Main loop: check both conditions and watch for disconnect
         while time.time() < deadline:
+            # If BlueZ says we're disconnected, stop waiting immediately.
+            if state["connected"] is False:
+                raise RuntimeError("Device disconnected while waiting for usable GATT state")
+
+            # ServicesResolved
+            if state["services_resolved"] is True:
+                return
+
+            # Single-pass scan for notify/control
             try:
-                v = await props.call_get(DEVICE_IFACE, "ServicesResolved")
-                if bool(_unwrap(v)):
+                self.objects = await self._get_managed_objects()
+                found_notify = False
+                found_ctrl = False
+
+                for path, ifaces in self.objects.items():
+                    ch = ifaces.get(GATT_CHRC_IFACE)
+                    if not ch:
+                        continue
+                    if self.dev_path and not path.startswith(self.dev_path + "/"):
+                        continue
+
+                    uuid = str(_unwrap(ch.get("UUID", "")) or "").lower()
+                    if uuid == self.notify_uuid:
+                        found_notify = True
+                    if uuid == self.ctrl_uuid:
+                        found_ctrl = True
+
+                if found_notify and found_ctrl:
                     return
             except Exception:
                 pass
+
             await asyncio.sleep(0.15)
 
-        raise RuntimeError("Timed out waiting for ServicesResolved=True")
+        raise RuntimeError(
+            "Timed out waiting for usable GATT state "
+            "(neither ServicesResolved nor notify/control characteristic discovery completed)."
+        )
 
-    async def _wait_first_notification(self, timeout_s: float = 2.0) -> bool:
+    async def _wait_first_notification(self, timeout_s: float = 3.0) -> bool:
         start_cnt = self._notif_count
         deadline = time.time() + timeout_s
         while time.time() < deadline:
@@ -453,7 +595,7 @@ class JC2OpticalMouse:
         # optical stream "on" when any of bytes 1..4 are non-zero
         return opt is not None and any(b != 0 for b in opt[1:])
 
-    async def _wait_optical_active(self, timeout_s: float = 2.0) -> bool:
+    async def _wait_optical_active(self, timeout_s: float = 1.0) -> bool:
         deadline = time.time() + timeout_s
         while time.time() < deadline:
             if self._optical_active(self._last_opt):
@@ -461,7 +603,7 @@ class JC2OpticalMouse:
             await asyncio.sleep(0.05)
         return False
 
-    async def _refresh_objects_until_gatt(self, timeout_s: float = 60.0) -> bool:
+    async def _refresh_objects_until_gatt(self, timeout_s: float = 10.0) -> bool:
         deadline = time.time() + timeout_s
         while time.time() < deadline:
             self.objects = await self._get_managed_objects()
@@ -506,26 +648,79 @@ class JC2OpticalMouse:
         self._dev = dev
         self._dev_props = props
 
+        self._install_dev_state_trace(props)
 
+        for key in ("Connected", "ServicesResolved", "Paired", "Bonded"):
+            try:
+                v = await props.call_get(DEVICE_IFACE, key)
+                setattr(self, f"_dev_{key.lower()}", bool(_unwrap(v)))
+            except Exception:
+                pass
+
+        def on_dev_props_changed(_iface, changed, _invalidated):
+            if "Connected" in changed:
+                try:
+                    self._dev_connected = bool(_unwrap(changed["Connected"]))
+                except Exception:
+                    pass
+            if "ServicesResolved" in changed:
+                try:
+                    self._dev_services_resolved = bool(_unwrap(changed["ServicesResolved"]))
+                except Exception:
+                    pass
+            if "Paired" in changed:
+                try:
+                    self._dev_paired = bool(_unwrap(changed["Paired"]))
+                except Exception:
+                    pass
+            if "Bonded" in changed:
+                try:
+                    self._dev_bonded = bool(_unwrap(changed["Bonded"]))
+                except Exception:
+                    pass
+
+        props.on_properties_changed(on_dev_props_changed)
+
+        # Trusting helps some policy paths, but must never be allowed to crash connect.
         try:
             await props.call_set(DEVICE_IFACE, "Trusted", Variant("b", True))
         except Exception:
             pass
 
-        _stderr("[jc2] Connecting...")
+        # Only call Connect if BlueZ doesn't already consider it connected.
+        already_connected = False
         try:
-            await dev.call_connect()
+            v = await props.call_get(DEVICE_IFACE, "Connected")
+            already_connected = bool(_unwrap(v))
+        except Exception:
+            pass
+
+        if not already_connected:
+            _stderr("[jc2] Connecting...")
+            try:
+                await dev.call_connect()
+            except Exception as ex:
+                # BlueZ throws variations of AlreadyConnected / InProgress; treat those as non-fatal.
+                s = str(ex).lower()
+                if "already" not in s and "in progress" not in s and "inprogress" not in s:
+                    raise
+        else:
+            _stderr("[jc2] Already connected (BlueZ).")
+
+        _stderr("[jc2] Connected. Waiting for usable GATT state...")
+        try:
+            await self._wait_usable_gatt_state(timeout_s=60.0)
         except Exception as ex:
-            if "Already" not in str(ex) and "already" not in str(ex):
-                raise
+            # Soft-fail: on the new-kernel path BlueZ often drops during gatt-client init.
+            # Let the outer retry loop handle it.
+            raise RuntimeError(f"GATT not usable yet: {ex}")
 
-        _stderr("[jc2] Connected. Waiting for services...")
-        await self._wait_services_resolved(timeout_s=8.0)
-        _stderr("[jc2] Services resolved. Waiting for GATT discovery...")
-
-        ok = await self._refresh_objects_until_gatt(timeout_s=60.0)
+        # If we got here, either ServicesResolved flipped OR the chars appeared.
+        # Still, explicitly try to confirm chars.
+        ok = await self._refresh_objects_until_gatt(timeout_s=30.0)
         if not ok:
-            raise RuntimeError("Connected, but notify/control characteristics never appeared.")
+            # Soft-fail: don't Disconnect here; caller will retry.
+            raise RuntimeError("GATT usable gate passed, but notify/control characteristics never appeared.")
 
         self._pick_characteristics()
 
@@ -550,40 +745,6 @@ class JC2OpticalMouse:
             self._handler_installed = True
 
         await self.ensure_notify_and_init()
-
-    async def _cycle_connection_once(self) -> None:
-        """Disconnect/connect once to un-wedge notify/write on rare BlueZ/device weirdness."""
-        if self._dev is None:
-            return
-
-        _stderr("[jc2] Cycling device connection once...")
-        try:
-            await asyncio.wait_for(self._dev.call_disconnect(), timeout=2.0)
-        except Exception:
-            pass
-
-        await asyncio.sleep(0.25)
-
-        try:
-            await asyncio.wait_for(self._dev.call_connect(), timeout=3.0)
-        except Exception:
-            # even if connect throws "AlreadyConnected", we can proceed
-            pass
-
-        # Wait for ServicesResolved again
-        await self._wait_services_resolved(timeout_s=8.0)
-
-        # Rebind notify/control proxies (disconnect can invalidate old ones)
-        ch_intro = await self.bus.introspect(BLUEZ, self.notify_path)
-        ch_obj = self.bus.get_proxy_object(BLUEZ, self.notify_path, ch_intro)
-        self._notify_ch = ch_obj.get_interface(GATT_CHRC_IFACE)
-        self._notify_props = ch_obj.get_interface(PROP_IFACE)
-
-        ctrl_intro = await self.bus.introspect(BLUEZ, self.ctrl_path)
-        ctrl_obj = self.bus.get_proxy_object(BLUEZ, self.ctrl_path, ctrl_intro)
-        self._ctrl_ch = ctrl_obj.get_interface(GATT_CHRC_IFACE)
-
-        # handler is already installed; no need to re-install
 
     async def ensure_notify_and_init(self) -> None:
         """
@@ -642,7 +803,7 @@ class JC2OpticalMouse:
                 await send_optical_init()
 
                 # Make sure we are actually receiving notifications (handler increments _notif_count).
-                if await self._wait_first_notification(timeout_s=1.0):
+                if await self._wait_first_notification(timeout_s=60.0):
                     # Optional: if optical shows non-zero within a short time, great.
                     if await self._wait_optical_active(timeout_s=0.8):
                         _stderr("[jc2] Optical stream active.")
@@ -663,6 +824,32 @@ class JC2OpticalMouse:
             # If we get here, notifications never started.
             _stderr("[jc2] ERROR: notifications never started; optical init could not be confirmed.")
 
+
+    async def disconnect(self):
+        # release virtual state first
+        try:
+            self._release_mouse_buttons()
+        except Exception:
+            pass
+
+        try:
+            self._release_gamepad_buttons()
+        except Exception:
+            pass
+
+        # stop notify best-effort
+        try:
+            if self._notify_ch is not None:
+                await self._notify_ch.call_stop_notify()
+        except Exception:
+            pass
+
+        # disconnect BLE best-effort
+        try:
+            if self._dev is not None:
+                await self._dev.call_disconnect()
+        except Exception:
+            pass
 
 
     # Mode switching helpers
@@ -949,7 +1136,7 @@ class JC2OpticalMouse:
                 # stick -> analog in gamepad mode
                 self._emit_gamepad_stick(x12, y12, cx, cy)
 
-                # --- Buttons ---
+        # --- Buttons ---
         if self.side != "left":
             # -------------------------
             # Right Joy-Con 2 (existing behavior)
@@ -1117,60 +1304,57 @@ class JC2OpticalMouse:
                 #   Physical Down  (was D-pad Left)  -> Xbox A (BTN_SOUTH)
                 #   Physical Left  (was D-pad Up)    -> Xbox X (BTN_WEST)
 
-                    phys_up    = dright
-                    phys_right = ddown
-                    phys_down  = dleft
-                    phys_left  = dup
+                phys_up    = dright
+                phys_right = ddown
+                phys_down  = dleft
+                phys_left  = dup
 
-                    LCOMPAT_SWAP_SOUTH_EAST = False  # swap A/B positions
-                    LCOMPAT_SWAP_WEST_NORTH = True  # swap X/Y positions
+                LCOMPAT_SWAP_SOUTH_EAST = False  # swap A/B positions
+                LCOMPAT_SWAP_WEST_NORTH = True  # swap X/Y positions
 
-                    # Map to Xbox face buttons (positional)
-                    gp_north = phys_up     # Xbox Y
-                    gp_east  = phys_right  # Xbox B
-                    gp_south = phys_down   # Xbox A
-                    gp_west  = phys_left   # Xbox X
+                # Map to Xbox face buttons (positional)
+                gp_north = phys_up     # Xbox Y
+                gp_east  = phys_right  # Xbox B
+                gp_south = phys_down   # Xbox A
+                gp_west  = phys_left   # Xbox X
 
-                    if LCOMPAT_SWAP_SOUTH_EAST:
-                        gp_south, gp_east = gp_east, gp_south
-                    if LCOMPAT_SWAP_WEST_NORTH:
-                        gp_west, gp_north = gp_north, gp_west
+                if LCOMPAT_SWAP_SOUTH_EAST:
+                    gp_south, gp_east = gp_east, gp_south
+                if LCOMPAT_SWAP_WEST_NORTH:
+                    gp_west, gp_north = gp_north, gp_west
 
-                    # SL/SR should act as LB/RB in horizontal mode
-                    gp_tl = sl
-                    gp_tr = sr
+                # SL/SR should act as LB/RB in horizontal mode
+                gp_tl = sl
+                gp_tr = sr
 
-                    # Start/Select
-                    gp_select = minus
-                    gp_start  = capture
+                # Start/Select
+                gp_select = minus
+                gp_start  = capture
 
-                    # Stick click
-                    gp_thumb = l3
+                # Stick click
+                gp_thumb = l3
 
-                    # L/ZL are reserved for mode-toggle chord; do not emit them in gamepad mode.
-                    # (No mapping here by design.)
+                # L/ZL are reserved for mode-toggle chord; do not emit them in gamepad mode.
+                # (No mapping here by design.)
 
-                    def emit_btn(keycode, name, pressed):
-                        prev = self._gp_prev[name]
-                        if pressed != prev:
-                            self.ui_pad.write(e.EV_KEY, keycode, 1 if pressed else 0)
-                            self._gp_prev[name] = pressed
+                def emit_btn(keycode, name, pressed):
+                    prev = self._gp_prev[name]
+                    if pressed != prev:
+                        self.ui_pad.write(e.EV_KEY, keycode, 1 if pressed else 0)
+                        self._gp_prev[name] = pressed
 
-                    emit_btn(e.BTN_SOUTH,  "south",  gp_south)
-                    emit_btn(e.BTN_EAST,   "east",   gp_east)
-                    emit_btn(e.BTN_WEST,   "west",   gp_west)
-                    emit_btn(e.BTN_NORTH,  "north",  gp_north)
+                emit_btn(e.BTN_SOUTH,  "south",  gp_south)
+                emit_btn(e.BTN_EAST,   "east",   gp_east)
+                emit_btn(e.BTN_WEST,   "west",   gp_west)
+                emit_btn(e.BTN_NORTH,  "north",  gp_north)
 
-                    emit_btn(e.BTN_TL,     "tl",     gp_tl)
-                    emit_btn(e.BTN_TR,     "tr",     gp_tr)
-                    emit_btn(e.BTN_SELECT, "select", gp_select)
-                    emit_btn(e.BTN_START,  "start",  gp_start)
-                    emit_btn(e.BTN_THUMBL, "thumb",  gp_thumb)
+                emit_btn(e.BTN_TL,     "tl",     gp_tl)
+                emit_btn(e.BTN_TR,     "tr",     gp_tr)
+                emit_btn(e.BTN_SELECT, "select", gp_select)
+                emit_btn(e.BTN_START,  "start",  gp_start)
+                emit_btn(e.BTN_THUMBL, "thumb",  gp_thumb)
 
-                    self.ui_pad.syn()
-
-
-
+                self.ui_pad.syn()
 
     def _btn_face(self, data: bytes, mask: int) -> bool:
         return len(data) > self._btn_face_idx and (data[self._btn_face_idx] & mask) != 0
@@ -1332,91 +1516,122 @@ class JC2OpticalMouse:
 
 
 async def run(mac: str, *, status: bool = True, status_hz: float = 5.0, verbose: bool = False):
-    drv = JC2OpticalMouse(mac, verbose=verbose)
-    await drv.connect()
-    await drv.start()
-    await drv.start_motion_pump()
-
-    _stderr("[jc2] Tip: press C to toggle mouse/gamepad mode.")
-
-    last_print = 0.0
-    last_count = 0
-    last_restart = 0.0
-    period = 1.0 / max(0.5, float(status_hz))
+    """
+    New-kernel resilient bringup:
+      - Keep retrying connect+start if BlueZ drops during gatt-client init.
+      - Never calls Device1.Disconnect on failure paths.
+      - Once notifications are flowing, we enter the normal status/watchdog loop.
+    """
+    attempt = 0
+    backoff = 0.35 # Quick retry to prevent disconnects
 
     while True:
-        await asyncio.sleep(0.2)
-        now = time.time()
+        attempt += 1
+        drv = JC2OpticalMouse(mac, verbose=verbose)
 
-        # Optical watchdog ONLY in mouse mode
-        if drv.mode == "mouse":
-            age = (now - drv._last_notif_ts) if drv._last_notif_ts else 999.0
+        try:
+            _stderr(f"[jc2] Bringup attempt {attempt} ...")
+            await drv.connect()
+            await drv.start()
+            await drv.start_motion_pump()
 
-            # Only warn/retry if notifications are alive but optical hasn't shown activity for a while
-            if age < 0.5 and (now - drv._last_opt_active_ts) > 2.0:
-                if (now - drv._last_opt_warn_ts) > 5.0:
-                    drv._last_opt_warn_ts = now
-                    sys.stderr.write("\n[jc2] WARNING: optical idle; retrying notify+init...\n")
+            _stderr("[jc2] Driver active.")
+            if drv.side == "left":
+                _stderr("[jc2] Tip: hold L+ZL to toggle mouse/gamepad mode.")
+            elif drv.side == "right":
+                _stderr("[jc2] Tip: press C to toggle mouse/gamepad mode.")
+            else:
+                _stderr("[jc2] Tip: Right uses C; Left uses hold L+ZL to toggle mouse/gamepad mode.")
+
+            last_print = 0.0
+            last_count = 0
+            last_restart = 0.0
+            period = 1.0 / max(0.5, float(status_hz))
+
+            while True:
+                await asyncio.sleep(0.2)
+                now = time.time()
+
+                if getattr(drv, "_dev_connected", None) is False:
+                    raise RuntimeError("BlueZ reports Connected=False (device dropped).")
+
+                if drv.mode == "mouse":
+                    age = (now - drv._last_notif_ts) if drv._last_notif_ts else 999.0
+
+                    if age < 0.5 and (now - drv._last_opt_active_ts) > 2.0:
+                        if (now - drv._last_opt_warn_ts) > 5.0:
+                            drv._last_opt_warn_ts = now
+                            sys.stderr.write("\n[jc2] WARNING: optical idle; retrying notify+init...\n")
+                            sys.stderr.flush()
+
+                        if (now - last_restart) > 3.0:
+                            last_restart = now
+                            try:
+                                await drv.ensure_notify_and_init()
+                            except Exception as ex:
+                                if verbose:
+                                    sys.stderr.write(f"[jc2] optical restart failed: {ex}\n")
+                                    sys.stderr.flush()
+
+                if not status:
+                    continue
+
+                if now - last_print >= period:
+                    last_print = now
+
+                    cnt = drv._notif_count
+                    dt_rate = max(1e-6, period)
+                    rate = (cnt - last_count) / dt_rate
+                    last_count = cnt
+
+                    opt_age = (now - drv._last_opt_ts) if drv._last_opt_ts else 999.0
+                    opt = drv._last_opt
+                    opt_s = "?? ?? ?? ?? ??" if opt is None else " ".join(f"{b:02x}" for b in opt)
+
+                    b4 = drv._last_raw_b4
+                    b5 = drv._last_raw_b5
+
+                    sr0, sr1, sr2 = drv._last_stick_raw
+                    cx = drv._stick_center_x12
+                    cy = drv._stick_center_y12
+
+                    mode_ch = "M" if drv.mode == "mouse" else "G"
+                    age = (now - drv._last_notif_ts) if drv._last_notif_ts else 999.0
+
+                    sys.stderr.write(
+                        f"\r[jc2] mode={mode_ch} notifs={cnt:6d} rate={rate:5.1f}/s age={age:4.1f}s "
+                        f"opt_age={opt_age:4.1f}s b4=0x{b4:02x} b5=0x{b5:02x} "
+                        f"stick={sr0:02x}{sr1:02x}{sr2:02x} "
+                        f"sx12={drv._last_stick_x12:4d} sy12={drv._last_stick_y12:4d} "
+                        f"c=({cx if cx is not None else -1},{cy if cy is not None else -1}) "
+                        f"opt=[{opt_s}]   "
+                    )
                     sys.stderr.flush()
 
-                if (now - last_restart) > 3.0:
-                    last_restart = now
-                    try:
-                        await drv.ensure_notify_and_init()
-                    except Exception as ex:
-                        if verbose:
-                            sys.stderr.write(f"[jc2] optical restart failed: {ex}\n")
-                            sys.stderr.flush()
-        else:
-            # In gamepad mode, don't spam optical re-inits
-            age = (now - drv._last_notif_ts) if drv._last_notif_ts else 999.0
+        except asyncio.CancelledError:
+            raise
 
+        except Exception as ex:
+            paired = getattr(drv, "_dev_paired", None)
+            bonded = getattr(drv, "_dev_bonded", None)
+            srv = getattr(drv, "_dev_services_resolved", None)
+            conn = getattr(drv, "_dev_connected", None)
 
+            _stderr(
+                f"[jc2] Bringup failed: {ex}\n"
+                f"[jc2] State: Connected={conn} ServicesResolved={srv} Paired={paired} Bonded={bonded}\n"
+                f"[jc2] Retrying in {backoff:.2f}s..."
+            )
 
-        if not status:
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 1.25, 2.0)
             continue
 
-        if now - last_print >= period:
-            last_print = now
-
-            cnt = drv._notif_count
-            dt_rate = max(1e-6, period)
-            rate = (cnt - last_count) / dt_rate
-            last_count = cnt
-
-            opt_age = (now - drv._last_opt_ts) if drv._last_opt_ts else 999.0
-            opt = drv._last_opt
-            opt_s = "?? ?? ?? ?? ??" if opt is None else " ".join(f"{b:02x}" for b in opt)
-
-            b4 = drv._last_raw_b4
-            b5 = drv._last_raw_b5
-
-            sr0, sr1, sr2 = drv._last_stick_raw
-            cx = drv._stick_center_x12
-            cy = drv._stick_center_y12
-
-            mode_ch = "M" if drv.mode == "mouse" else "G"
-
-            sys.stderr.write(
-                f"\r[jc2] mode={mode_ch} notifs={cnt:6d} rate={rate:5.1f}/s age={age:4.1f}s "
-                f"opt_age={opt_age:4.1f}s b4=0x{b4:02x} b5=0x{b5:02x} "
-                f"stick={sr0:02x}{sr1:02x}{sr2:02x} "
-                f"sx12={drv._last_stick_x12:4d} sy12={drv._last_stick_y12:4d} "
-                f"c=({cx if cx is not None else -1},{cy if cy is not None else -1}) "
-                f"opt=[{opt_s}]   "
-            )
-            sys.stderr.flush()
-
-# ============================================================
-# Combined full-controller mode (Left + Right Joy-Con 2)
-#   - Exposes ONE virtual Xbox-ish gamepad
-#   - Right C toggles "Right-only mouse mode":
-#       * Right contributes mouse (optical + clicks + scroll)
-#       * Right gamepad half is suppressed
-#       * Left continues contributing left half of gamepad
-# ============================================================
-
-from dbus_next.errors import DBusError
+        finally:
+            try:
+                await drv.disconnect()
+            except Exception:
+                pass
 
 
 def _abs_from_rxry(rx: int, ry: int) -> tuple[int, int]:
@@ -1424,36 +1639,6 @@ def _abs_from_rxry(rx: int, ry: int) -> tuple[int, int]:
     ax = int(clamp(32768 + (rx * 32768 / 2048), 0, 65535))
     ay = int(clamp(32768 - (ry * 32768 / 2048), 0, 65535))  # ABS_Y down is +
     return ax, ay
-
-
-def _rotate_stick_for_side(side: str, x12: int, y12: int, cx: int, cy: int) -> tuple[int, int]:
-    """
-    Return (rx, ry) as signed stick deflection after "sideways rail-up" rotation.
-    Convention:
-      dx = +right
-      dy = +up  (we compute dy = cy - y12)
-    Right Joy-Con sideways rail-up => clockwise  90°: (x,y)->( y, -x)
-    Left  Joy-Con sideways rail-up => counterCW  90°: (x,y)->(-y,  x)
-    """
-    dx = x12 - cx
-    dy = cy - y12  # up positive
-
-    if abs(dx) <= STICK_DEADZONE_12:
-        dx = 0
-    if abs(dy) <= STICK_DEADZONE_12:
-        dy = 0
-
-    if side == "left":
-        rx = -dy
-        ry = dx
-    else:
-        rx = dy
-        ry = -dx
-
-    rx = int(clamp(rx, -2048, 2048))
-    ry = int(clamp(ry, -2048, 2048))
-    return rx, ry
-
 
 class _JC2Endpoint:
     """
@@ -1523,6 +1708,14 @@ class _JC2Endpoint:
         self.last_opt_dx = 0
         self.last_opt_dy = 0
 
+        # dev property telemetry (for new-kernel diagnosis)
+        self._dev_connected: bool | None = None
+        self._dev_services_resolved: bool | None = None
+        self._dev_paired: bool | None = None
+        self._dev_bonded: bool | None = None
+        self._dev_prop_watch_installed = False
+        self._dev_last_change_ts = 0.0
+
     async def _get_managed_objects(self):
         intro = await self.bus.introspect(BLUEZ, "/")
         om_obj = self.bus.get_proxy_object(BLUEZ, "/", intro)
@@ -1536,30 +1729,65 @@ class _JC2Endpoint:
                 return path
         raise RuntimeError(f"Device {self.mac} not found in BlueZ object tree.")
 
-    async def _wait_services_resolved(self, timeout_s: float = 8.0) -> None:
-        dev_intro = await self.bus.introspect(BLUEZ, self.dev_path)
-        dev_obj = self.bus.get_proxy_object(BLUEZ, self.dev_path, dev_intro)
-        props = dev_obj.get_interface(PROP_IFACE)
+    def _install_dev_prop_watch(self, props) -> None:
+        """
+        Track key Device1 properties in-process so we can correlate:
+        - Connected drop
+        - ServicesResolved never flipping
+        - Paired/Bonded attempts
+        """
+        if self._dev_prop_watch_installed:
+            return
 
-        deadline = time.time() + timeout_s
-        while time.time() < deadline:
-            try:
-                v = await props.call_get(DEVICE_IFACE, "ServicesResolved")
-                if bool(_unwrap(v)):
-                    return
-            except Exception:
-                pass
-            await asyncio.sleep(0.15)
+        def _log(name: str, val) -> None:
+            if self.verbose:
+                _stderr(f"[jc2][dbg] Device1.{name} -> {val}")
 
-        raise RuntimeError("Timed out waiting for ServicesResolved=True")
+        def on_changed(_iface, changed, _invalidated):
+            now = time.time()
+            self._dev_last_change_ts = now
+
+            if "Connected" in changed:
+                try:
+                    self._dev_connected = bool(_unwrap(changed["Connected"]))
+                    _log("Connected", self._dev_connected)
+                except Exception:
+                    pass
+
+            if "ServicesResolved" in changed:
+                try:
+                    self._dev_services_resolved = bool(_unwrap(changed["ServicesResolved"]))
+                    _log("ServicesResolved", self._dev_services_resolved)
+                except Exception:
+                    pass
+
+            if "Paired" in changed:
+                try:
+                    self._dev_paired = bool(_unwrap(changed["Paired"]))
+                    _log("Paired", self._dev_paired)
+                except Exception:
+                    pass
+
+            if "Bonded" in changed:
+                try:
+                    self._dev_bonded = bool(_unwrap(changed["Bonded"]))
+                    _log("Bonded", self._dev_bonded)
+                except Exception:
+                    pass
+
+        props.on_properties_changed(on_changed)
+        self._dev_prop_watch_installed = True
 
     async def _refresh_objects_until_gatt(self, timeout_s: float = 60.0) -> bool:
-        deadline = time.time() + timeout_s
-        while time.time() < deadline:
-            self.objects = await self._get_managed_objects()
+        """
+        Refresh the BlueZ object tree until notify+ctrl characteristics appear.
 
+        If timeout_s <= 0: perform exactly one scan and return.
+        """
+        def scan_once() -> bool:
             found_notify = False
             found_ctrl = False
+
             for path, ifaces in self.objects.items():
                 ch = ifaces.get(GATT_CHRC_IFACE)
                 if not ch:
@@ -1573,9 +1801,18 @@ class _JC2Endpoint:
                 if uuid == self.ctrl_uuid:
                     found_ctrl = True
 
-            if found_notify and found_ctrl:
-                return True
+            return found_notify and found_ctrl
 
+        # One-shot mode
+        if timeout_s <= 0:
+            self.objects = await self._get_managed_objects()
+            return scan_once()
+
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            self.objects = await self._get_managed_objects()
+            if scan_once():
+                return True
             await asyncio.sleep(0.25)
 
         return False
@@ -1603,6 +1840,88 @@ class _JC2Endpoint:
 
         self.notify_path = notify_path
         self.ctrl_path = ctrl_path
+
+    def _try_pick_characteristics(self) -> bool:
+        """
+        Non-throwing version of _pick_characteristics().
+        Returns True once both notify/control characteristic paths are present.
+        """
+        notify_path = None
+        ctrl_path = None
+
+        for path, ifaces in self.objects.items():
+            ch = ifaces.get(GATT_CHRC_IFACE)
+            if not ch:
+                continue
+            if self.dev_path and not path.startswith(self.dev_path + "/"):
+                continue
+
+            uuid = str(_unwrap(ch.get("UUID", "")) or "").lower()
+            if uuid == self.notify_uuid:
+                notify_path = path
+            if uuid == self.ctrl_uuid:
+                ctrl_path = path
+
+        if notify_path and ctrl_path:
+            self.notify_path = notify_path
+            self.ctrl_path = ctrl_path
+            return True
+
+        return False
+
+    async def _wait_until_ready(self, timeout_s: float = 15.0) -> str:
+        """
+        Wait until the endpoint is usable.
+
+        Success = either:
+          - notify/control GATT characteristic objects appear, or
+          - ServicesResolved progresses enough that GATT objects appear shortly after.
+
+        Do not hard-fail purely because ServicesResolved stays false.
+        """
+        dev_intro = await self.bus.introspect(BLUEZ, self.dev_path)
+        dev_obj = self.bus.get_proxy_object(BLUEZ, self.dev_path, dev_intro)
+        props = dev_obj.get_interface(PROP_IFACE)
+
+        deadline = time.time() + timeout_s
+        saw_services_resolved = False
+
+        while time.time() < deadline:
+            connected = True
+            try:
+                v = await props.call_get(DEVICE_IFACE, "Connected")
+                connected = bool(_unwrap(v))
+            except Exception:
+                pass
+
+            if not connected:
+                raise RuntimeError(f"{self.expected_side} endpoint disconnected while waiting for GATT readiness.")
+
+            try:
+                v = await props.call_get(DEVICE_IFACE, "ServicesResolved")
+                if bool(_unwrap(v)):
+                    saw_services_resolved = True
+            except Exception:
+                pass
+
+            try:
+                self.objects = await self._get_managed_objects()
+                if self._try_pick_characteristics():
+                    return "gatt-chars"
+            except Exception:
+                pass
+
+            await asyncio.sleep(0.20)
+
+        if saw_services_resolved:
+            raise RuntimeError(
+                f"{self.expected_side} endpoint reached ServicesResolved, "
+                f"but notify/control characteristics never appeared."
+            )
+
+        raise RuntimeError(
+            f"{self.expected_side} endpoint timed out waiting for usable GATT state."
+        )
 
     async def _detect_and_configure_side(self, props) -> None:
         """
@@ -1796,6 +2115,18 @@ class _JC2Endpoint:
         self._dev = dev
         self._dev_props = props
 
+
+        # Install watcher ASAP (before Connect) so we don't miss the flip/flop.
+        self._install_dev_prop_watch(props)
+
+        # Prime values (best effort)
+        for key in ("Connected", "ServicesResolved", "Paired", "Bonded"):
+            try:
+                v = await props.call_get(DEVICE_IFACE, key)
+                setattr(self, f"_dev_{key.lower()}", bool(_unwrap(v)))
+            except Exception:
+                pass
+
         await self._detect_and_configure_side(props)
 
         try:
@@ -1803,13 +2134,27 @@ class _JC2Endpoint:
         except Exception:
             pass
 
-        await dev.call_connect()
-        await self._wait_services_resolved(timeout_s=10.0)
+        try:
+            await dev.call_connect()
+        except Exception as ex:
+            s = str(ex)
+            if "Already" not in s and "already" not in s:
+                raise
 
-        ok = await self._refresh_objects_until_gatt(timeout_s=60.0)
+        ready_reason = await self._wait_until_ready(timeout_s=60.0)
+
+        if self.notify_path and self.ctrl_path:
+            if self.verbose:
+                _stderr(f"[jc2][dbg] {self.expected_side} endpoint ready ({ready_reason})")
+            return
+
+        ok = await self._refresh_objects_until_gatt(timeout_s=10.0)
         if not ok:
             raise RuntimeError("Connected, but notify/control characteristics never appeared.")
         self._pick_characteristics()
+
+        if self.verbose:
+            _stderr(f"[jc2][dbg] {self.expected_side} endpoint GATT characteristics found")
 
     async def start(self):
         ch_intro = await self.bus.introspect(BLUEZ, self.notify_path)

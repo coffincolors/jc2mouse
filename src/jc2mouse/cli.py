@@ -14,6 +14,7 @@ from dbus_next.constants import BusType
 from dbus_next.errors import DBusError
 
 from jc2mouse.driver import run as run_driver, run_combined
+from jc2mouse.ns2pro import run_ns2_pro
 from jc2mouse.mapper import run_button_wizard
 
 BLUEZ = "org.bluez"
@@ -24,11 +25,14 @@ PROP_IFACE = "org.freedesktop.DBus.Properties"
 
 # Manufacturer / Joy-Con 2 signature (observed stable pattern)
 NINTENDO_COMPANY_ID = 0x0553
-JC2_MFG_LEN = 24
-JC2_MFG_PREFIX = bytes.fromhex("01 00 03 7e 05")  # first 5 bytes
-JC2_SIDE_BYTE_IDX = 5  # 0-based in mfg payload
-JC2_SIDE_RIGHT = 0x66
-JC2_SIDE_LEFT = 0x67
+NS2_MFG_LEN = 24
+NS2_MFG_PREFIX = bytes.fromhex("01 00 03 7e 05")
+NS2_SUBTYPE_IDX = 5
+
+NS2_SUBTYPE_RIGHT = 0x66
+NS2_SUBTYPE_LEFT = 0x67
+NS2_SUBTYPE_PRO = 0x69
+
 
 # Session services (see scripts/jc2-session.sh)
 STOCK_BT_SERVICE = "bluetooth.service"
@@ -88,19 +92,27 @@ def _format_bytes(b: bytes, max_len: int = 24) -> str:
     return b[:max_len].hex() + "…"
 
 
-def _side_from_mfg(mfg: bytes) -> str:
-    if len(mfg) <= JC2_SIDE_BYTE_IDX:
-        return "unknown"
-    sb = mfg[JC2_SIDE_BYTE_IDX]
-    if sb == JC2_SIDE_RIGHT:
-        return "right"
-    if sb == JC2_SIDE_LEFT:
-        return "left"
-    return "unknown"
+def _classify_nintendo_mfg(mfg: bytes) -> Dict[str, str]:
+    if len(mfg) != NS2_MFG_LEN or not mfg.startswith(NS2_MFG_PREFIX):
+        return {"kind": "unknown", "side": "unknown"}
+
+    if len(mfg) <= NS2_SUBTYPE_IDX:
+        return {"kind": "unknown", "side": "unknown"}
+
+    subtype = mfg[NS2_SUBTYPE_IDX]
+
+    if subtype == NS2_SUBTYPE_RIGHT:
+        return {"kind": "jc2", "side": "right"}
+    if subtype == NS2_SUBTYPE_LEFT:
+        return {"kind": "jc2", "side": "left"}
+    if subtype == NS2_SUBTYPE_PRO:
+        return {"kind": "ns2pro", "side": "pro"}
+
+    return {"kind": "unknown", "side": "unknown"}
 
 
-def _is_jc2_mfg(mfg: bytes) -> bool:
-    return (len(mfg) == JC2_MFG_LEN) and mfg.startswith(JC2_MFG_PREFIX)
+def _is_supported_nintendo_mfg(mfg: bytes) -> bool:
+    return (len(mfg) == NS2_MFG_LEN) and mfg.startswith(NS2_MFG_PREFIX)
 
 
 def _rssi_live(rssi: Optional[int]) -> bool:
@@ -145,7 +157,11 @@ def _extract_device_candidate(objects: Dict[str, Any], path: str) -> Optional[Di
     except Exception:
         return None
 
-    if not _is_jc2_mfg(mfg):
+    if not _is_supported_nintendo_mfg(mfg):
+        return None
+
+    info = _classify_nintendo_mfg(mfg)
+    if info["kind"] == "unknown":
         return None
 
     rssi_v = _unwrap(dev.get("RSSI"))
@@ -155,7 +171,8 @@ def _extract_device_candidate(objects: Dict[str, Any], path: str) -> Optional[Di
         rssi = None
 
     name = _unwrap(dev.get("Name")) or _unwrap(dev.get("Alias")) or ""
-    side = _side_from_mfg(mfg)
+    kind = info["kind"]
+    side = info["side"]
 
     return {
         "path": path,
@@ -164,6 +181,7 @@ def _extract_device_candidate(objects: Dict[str, Any], path: str) -> Optional[Di
         "connected": connected,
         "rssi": rssi,
         "mfg": mfg,
+        "kind": kind,
         "side": side,
         "seen_ts": time.time(),
     }
@@ -296,10 +314,6 @@ async def discover_jc2(
 
 
 async def _disconnect_device_by_mac(mac: str) -> bool:
-    """
-    Best-effort disconnect using BlueZ Device1.Disconnect.
-    Returns True if we found the device and issued Disconnect.
-    """
     mac = mac.upper()
     bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
     objects = await _get_managed_objects(bus)
@@ -310,6 +324,7 @@ async def _disconnect_device_by_mac(mac: str) -> bool:
         if path.endswith(suffix) and DEVICE_IFACE in ifaces:
             dev_path = path
             break
+
     if not dev_path:
         return False
 
@@ -321,7 +336,7 @@ async def _disconnect_device_by_mac(mac: str) -> bool:
         await dev.call_disconnect()
         return True
     except Exception:
-        return True
+        return False
 
 
 def _friendly_connect_error(ex: Exception) -> str:
@@ -338,6 +353,42 @@ def _friendly_connect_error(ex: Exception) -> str:
         )
     return s
 
+def _should_skip_disconnect_cleanup_on_error(ex: BaseException) -> bool:
+    """
+    Suppress exit-time Device1.Disconnect only for early startup/connect failures,
+    to avoid reintroducing connect/disconnect races during bring-up.
+    """
+    s = str(ex)
+
+    startup_markers = (
+        "le-connection-abort-by-local",
+        "GATT not usable yet:",
+        "Timed out waiting for usable GATT state",
+        "notify/control characteristics never appeared",
+        "No LIVE Joy-Con 2 advertisers found",
+        "could not find a LEFT Joy-Con 2",
+        "could not find a RIGHT Joy-Con 2",
+        "StartDiscovery failed:",
+        "provide --mac or use --auto",
+    )
+
+    return any(marker in s for marker in startup_markers)
+
+async def _pick_auto_device(
+    *,
+    label: str,
+    side: str,
+    timeout_s: float,
+    prefer_connected: bool,
+) -> Dict[str, Any]:
+    pick, _live, _stale = await discover_jc2(
+        timeout_s=timeout_s,
+        side_filter=side,
+        prefer_connected=prefer_connected,
+    )
+    if not pick:
+        raise SystemExit(f"ERROR: could not find a {label.upper()} Joy-Con 2 (no LIVE advertisers found).")
+    return pick
 
 def main():
     ap = argparse.ArgumentParser(prog="jc2mouse")
@@ -347,11 +398,11 @@ def main():
     sub.add_parser("start", help="Enter jc2 session mode (stop stock bluetooth, start patched bluetoothd)")
     sub.add_parser("stop", help="Exit jc2 session mode (stop patched bluetoothd, restore stock bluetooth)")
 
-    p_run = sub.add_parser("run", help="Run Joy-Con 2 driver")
+    p_run = sub.add_parser("run", help="Run Joy-Con 2 / Nintendo Switch 2 controller driver")
     p_run.add_argument("--mac", help="Joy-Con 2 MAC address (e.g. 98:E2:55:DF:56:13)")
-    p_run.add_argument("--auto", action="store_true", help="Auto-detect Joy-Con 2 and run it")
+    p_run.add_argument("--auto", action="store_true", help="Auto-detect a supported Nintendo Switch 2 controller")
     p_run.add_argument("--side", choices=["any", "right", "left"], default="any",
-                       help="When using --auto, filter by side")
+                       help="When using --auto, filter Joy-Con selection by side")
     p_run.add_argument("--timeout", type=float, default=8.0, help="Auto-discovery scan time seconds (default: 8)")
     p_run.add_argument("--ask", action="store_true", help="If multiple LIVE devices match, ask which to use")
     p_run.add_argument("--no-prefer-connected", action="store_true",
@@ -362,18 +413,24 @@ def main():
     p_run.add_argument("--verbose", action="store_true", help="Developer verbosity (rarely needed)")
 
     # QoL / lifecycle
-    p_run.add_argument("--session", choices=["auto", "on", "off"], default="auto",
-                       help="Session mode handling: auto=start jc2 session if needed (default), on=force start, off=do nothing")
+    p_run.add_argument(
+        "--session",
+        choices=["auto", "on", "off"],
+        default="off",
+        help="Bluetooth daemon handling: off=use current system bluetoothd (default), auto=start jc2 session if needed, on=force jc2 session",
+    )
     p_run.add_argument("--leave-session", action="store_true",
                        help="When --session auto starts the session, do NOT stop it on exit")
-    p_run.add_argument("--disconnect-on-exit", action="store_true", default=True,
-                       help="Best-effort disconnect Joy-Con on exit (default: on)")
+    p_run.add_argument("--disconnect-on-exit", dest="disconnect_on_exit", action="store_true", default=False,
+                       help="Best-effort disconnect controller(s) on exit")
     p_run.add_argument("--no-disconnect-on-exit", dest="disconnect_on_exit", action="store_false",
-                       help="Do NOT disconnect Joy-Con on exit")
+                       help="Do NOT disconnect controller(s) on exit")
 
-    # Roadmap: combined mode (stub for now)
-    p_run.add_argument("--combined", action="store_true",
-                       help="(WIP) Combined full-controller mode using both Joy-Cons (not implemented yet)")
+    p_run.add_argument(
+        "--combined",
+        action="store_true",
+        help="Use both Joy-Cons as one combined controller; Right C toggles right-side mouse overlay",
+    )
 
     p_scan = sub.add_parser("scan", help="Scan and list LIVE Joy-Con 2 candidates (no connect)")
     p_scan.add_argument("--side", choices=["any", "right", "left"], default="any", help="Filter by side")
@@ -382,6 +439,23 @@ def main():
 
     p_map = sub.add_parser("dev-map-buttons", help="Developer: interactively discover button bit/byte positions")
     p_map.add_argument("--mac", required=True, help="Joy-Con 2 MAC address")
+
+    p_ns2pro = sub.add_parser("ns2pro", help="Run Nintendo Switch 2 Pro Controller driver")
+    p_ns2pro.add_argument("--mac", required=True, help="Switch 2 Pro Controller MAC address")
+    p_ns2pro.add_argument("--status-hz", type=float, default=5.0, help="Status refresh rate (default: 5 Hz)")
+    p_ns2pro.add_argument("--verbose", action="store_true", help="Developer verbosity")
+    p_ns2pro.add_argument(
+        "--session",
+        choices=["auto", "on", "off"],
+        default="off",
+        help="Bluetooth daemon handling: off=use current system bluetoothd (default), auto=start jc2 session if needed, on=force jc2 session",
+    )
+    p_ns2pro.add_argument("--leave-session", action="store_true",
+                          help="When --session auto starts the session, do NOT stop it on exit")
+    p_ns2pro.add_argument("--disconnect-on-exit", dest="disconnect_on_exit", action="store_true", default=False,
+                          help="Best-effort disconnect controller on exit")
+    p_ns2pro.add_argument("--no-disconnect-on-exit", dest="disconnect_on_exit", action="store_false",
+                          help="Do NOT disconnect controller on exit")
 
     args = ap.parse_args()
     _require_root()
@@ -433,25 +507,28 @@ def main():
             asyncio.run(_do_scan())
         except KeyboardInterrupt:
             print("\n[jc2] Stopped.", file=sys.stderr)
+            return 130
+        except Exception as ex:
+            print(f"ERROR: {ex}", file=sys.stderr)
+            return 1
         return 0
 
     if args.cmd == "run":
         started_session = False
-        chosen_mac: Optional[str] = None
+        chosen_macs: List[str] = []
         chosen_side: str = "unknown"
+        chosen_kind: str = "unknown"
+        skip_disconnect_cleanup = False
 
         async def _do_run():
-            nonlocal started_session, chosen_mac, chosen_side
+            nonlocal started_session, chosen_macs, chosen_side, chosen_kind
 
             if args.combined:
-                # session handling
                 try:
                     started_session = _ensure_session(args.session)
                 except Exception as ex:
                     raise SystemExit(f"ERROR: failed to enter session mode: {ex}")
 
-                # Combined requires BOTH Joy-Cons.
-                # We always pick one LEFT and one RIGHT (side is detected via ManufacturerData).
                 if not args.auto:
                     raise SystemExit("ERROR: combined mode currently requires --auto (it will auto-pick left+right).")
 
@@ -459,35 +536,39 @@ def main():
 
                 sys.stderr.write("[jc2] Combined mode: we will pick LEFT then RIGHT.\n")
                 sys.stderr.write("[jc2] Hold PAIR on the LEFT Joy-Con first until it appears.\n")
-                sys.stderr.write("[jc2] Tip: avoid pressing other buttons while it’s connecting.\n")
+                sys.stderr.write("[jc2] Tip: If the controller disconnects on first attempt (LEDs stop flashing), hold pairing once more on the disconnected Joy-Con 2.\n")
                 sys.stderr.flush()
 
-                pick_l, live_l, _ = await discover_jc2(
+                pick_l = await _pick_auto_device(
+                    label="left",
+                    side="left",
                     timeout_s=args.timeout,
-                    side_filter="left",
                     prefer_connected=prefer_connected,
                 )
-                if not pick_l:
-                    raise SystemExit("ERROR: could not find a LEFT Joy-Con 2 (no LIVE advertisers found).")
 
                 left_mac = pick_l["mac"]
                 sys.stderr.write(f"[jc2] Picked LEFT  {left_mac} (rssi={pick_l.get('rssi')})\n")
                 sys.stderr.write("[jc2] Now hold PAIR on the RIGHT Joy-Con.\n")
                 sys.stderr.flush()
 
-                pick_r, live_r, _ = await discover_jc2(
+                pick_r = await _pick_auto_device(
+                    label="right",
+                    side="right",
                     timeout_s=args.timeout,
-                    side_filter="right",
                     prefer_connected=prefer_connected,
                 )
-                if not pick_r:
-                    raise SystemExit("ERROR: could not find a RIGHT Joy-Con 2 (no LIVE advertisers found).")
 
                 right_mac = pick_r["mac"]
                 sys.stderr.write(f"[jc2] Picked RIGHT {right_mac} (rssi={pick_r.get('rssi')})\n")
+                sys.stderr.write("[jc2] Press Ctrl+C to stop.\n")
+                if args.disconnect_on_exit:
+                    sys.stderr.write("[jc2] Controllers will be disconnected on exit.\n")
+                else:
+                    sys.stderr.write("[jc2] Use --disconnect-on-exit to disconnect controllers on exit.\n")
                 sys.stderr.flush()
 
-                # Run combined controller
+                chosen_macs = [left_mac, right_mac]
+
                 try:
                     await run_combined(
                         left_mac=left_mac,
@@ -496,14 +577,14 @@ def main():
                         status_hz=args.status_hz,
                         verbose=args.verbose,
                     )
+                except DBusError as ex:
+                    msg = _friendly_connect_error(ex)
+                    raise SystemExit(f"ERROR: {msg}")
                 except Exception as ex:
-                    # nicer error on the common BLE abort
-                    raise SystemExit(_friendly_connect_error(ex))
+                    raise SystemExit(f"ERROR: {ex}")
 
                 return
 
-
-            # session handling
             try:
                 started_session = _ensure_session(args.session)
             except Exception as ex:
@@ -514,8 +595,8 @@ def main():
             if args.auto:
                 prefer_connected = not args.no_prefer_connected
 
-                sys.stderr.write("[jc2] Auto mode: hold the PAIR button if not already connected.\n")
-                sys.stderr.write("[jc2] Tip: use --ask if multiple Joy-Con 2 are advertising.\n")
+                sys.stderr.write("[jc2] Auto mode: hold the PAIR button if the controller is not already connected.\n")
+                sys.stderr.write("[jc2] Tip: use --ask if multiple Nintendo Switch 2 controllers are advertising.\n")
                 sys.stderr.write("[jc2] Tip: avoid pressing other buttons while it’s connecting.\n")
                 sys.stderr.flush()
 
@@ -528,10 +609,16 @@ def main():
                 if pick:
                     mac = pick["mac"]
                     chosen_side = pick.get("side", "unknown")
-                    sys.stderr.write(f"[jc2] Auto-selected {mac} (side={chosen_side}, rssi={pick.get('rssi')})\n")
+                    chosen_kind = pick.get("kind", "unknown")
+                    sys.stderr.write(
+                        f"[jc2] Auto-selected {mac} "
+                        f"(kind={chosen_kind}, side={chosen_side}, rssi={pick.get('rssi')})\n"
+                    )
                     sys.stderr.flush()
 
-                    if chosen_side == "left":
+                    if chosen_kind == "ns2pro":
+                        sys.stderr.write("[jc2] Nintendo Switch 2 Pro Controller detected.\n")
+                    elif chosen_side == "left":
                         sys.stderr.write("[jc2] Left Joy-Con tip: hold L+ZL to toggle mouse/gamepad.\n")
                     elif chosen_side == "right":
                         sys.stderr.write("[jc2] Right Joy-Con tip: press C to toggle mouse/gamepad.\n")
@@ -539,7 +626,6 @@ def main():
                         sys.stderr.write("[jc2] Tip: Right uses C; Left uses hold L+ZL to toggle.\n")
                     sys.stderr.flush()
 
-                    # Only print listings if we actually scanned and found multiple
                     if live and len(live) > 1:
                         sys.stderr.write("\n[jc2] LIVE advertisers:\n")
                         for i, c in enumerate(live, 1):
@@ -549,7 +635,6 @@ def main():
                             )
                         sys.stderr.flush()
 
-                    # Optional interactive pick
                     if args.ask and live and len(live) > 1 and sys.stdin.isatty():
                         while True:
                             choice = input(f"Select device [1-{len(live)}] (Enter=best): ").strip()
@@ -560,7 +645,10 @@ def main():
                                 if 1 <= idx <= len(live):
                                     mac = live[idx - 1]["mac"]
                                     chosen_side = live[idx - 1].get("side", "unknown")
-                                    sys.stderr.write(f"[jc2] Selected {mac} (side={chosen_side})\n")
+                                    chosen_kind = live[idx - 1].get("kind", "unknown")
+                                    sys.stderr.write(
+                                        f"[jc2] Selected {mac} (kind={chosen_kind}, side={chosen_side})\n"
+                                    )
                                     sys.stderr.flush()
                                     break
                             except ValueError:
@@ -570,15 +658,29 @@ def main():
             if not mac:
                 raise SystemExit("ERROR: provide --mac or use --auto")
 
-            chosen_mac = mac
+            chosen_macs = [mac]
+
+            sys.stderr.write("[jc2] Press Ctrl+C to stop.\n")
+            if args.disconnect_on_exit:
+                sys.stderr.write("[jc2] Controller will be disconnected on exit.\n")
+            else:
+                sys.stderr.write("[jc2] Use --disconnect-on-exit to disconnect the controller on exit.\n")
+            sys.stderr.flush()
 
             try:
-                await run_driver(
-                    mac,
-                    status=(not args.no_status),
-                    status_hz=args.status_hz,
-                    verbose=args.verbose,
-                )
+                if chosen_kind == "ns2pro":
+                    await run_ns2_pro(
+                        mac,
+                        status_hz=args.status_hz,
+                        verbose=args.verbose,
+                    )
+                else:
+                    await run_driver(
+                        mac,
+                        status=(not args.no_status),
+                        status_hz=args.status_hz,
+                        verbose=args.verbose,
+                    )
             except DBusError as ex:
                 msg = _friendly_connect_error(ex)
                 raise SystemExit(f"ERROR: {msg}")
@@ -589,17 +691,24 @@ def main():
             asyncio.run(_do_run())
         except KeyboardInterrupt:
             print("\n[jc2] Stopped.", file=sys.stderr)
+            return 130
+        except SystemExit as ex:
+            if _should_skip_disconnect_cleanup_on_error(ex):
+                skip_disconnect_cleanup = True
+            raise
+        except Exception as ex:
+            if _should_skip_disconnect_cleanup_on_error(ex):
+                skip_disconnect_cleanup = True
+            raise
         finally:
-            # Best-effort disconnect (so the Joy-Con doesn’t stay connected after exit)
-            if args.disconnect_on_exit and chosen_mac:
-                try:
-                    asyncio.run(_disconnect_device_by_mac(chosen_mac))
-                except Exception:
-                    pass
+            if args.disconnect_on_exit and chosen_macs and (not skip_disconnect_cleanup):
+                for mac in reversed(chosen_macs):
+                    try:
+                        asyncio.run(_disconnect_device_by_mac(mac))
+                    except Exception:
+                        pass
 
-            # Stop session if we started it (unless user asked to leave it)
             if started_session and (not args.leave_session):
-                # If stock bluetooth is masked, stopping session would leave the system with no bluetoothd.
                 if _service_is_masked("bluetooth.service"):
                     print(
                         "\n[jc2] NOTE: bluetooth.service is masked; leaving jc2 session active "
@@ -615,7 +724,6 @@ def main():
                     except Exception:
                         pass
 
-
         return 0
 
     if args.cmd == "dev-map-buttons":
@@ -623,6 +731,80 @@ def main():
             asyncio.run(run_button_wizard(args.mac))
         except KeyboardInterrupt:
             print("\n[jc2] Stopped.", file=sys.stderr)
+            return 130
+        return 0
+
+    if args.cmd == "ns2pro":
+        started_session = False
+        chosen_macs: List[str] = []
+        skip_disconnect_cleanup = False
+
+        async def _do_ns2pro():
+            nonlocal started_session, chosen_macs
+
+            try:
+                started_session = _ensure_session(args.session)
+            except Exception as ex:
+                raise SystemExit(f"ERROR: failed to enter session mode: {ex}")
+
+            chosen_macs = [args.mac.upper()]
+
+            sys.stderr.write("[ns2pro] Press Ctrl+C to stop.\n")
+            if args.disconnect_on_exit:
+                sys.stderr.write("[ns2pro] Controller will be disconnected on exit.\n")
+            else:
+                sys.stderr.write("[ns2pro] Use --disconnect-on-exit to disconnect the controller on exit.\n")
+            sys.stderr.flush()
+
+            try:
+                await run_ns2_pro(
+                    args.mac,
+                    status_hz=args.status_hz,
+                    verbose=args.verbose,
+                )
+            except DBusError as ex:
+                msg = _friendly_connect_error(ex)
+                raise SystemExit(f"ERROR: {msg}")
+            except Exception as ex:
+                raise SystemExit(f"ERROR: {ex}")
+
+        try:
+            asyncio.run(_do_ns2pro())
+        except KeyboardInterrupt:
+            print("\n[ns2pro] Stopped.", file=sys.stderr)
+            return 130
+        except SystemExit as ex:
+            if _should_skip_disconnect_cleanup_on_error(ex):
+                skip_disconnect_cleanup = True
+            raise
+        except Exception as ex:
+            if _should_skip_disconnect_cleanup_on_error(ex):
+                skip_disconnect_cleanup = True
+            raise
+        finally:
+            if args.disconnect_on_exit and chosen_macs and (not skip_disconnect_cleanup):
+                for mac in reversed(chosen_macs):
+                    try:
+                        asyncio.run(_disconnect_device_by_mac(mac))
+                    except Exception:
+                        pass
+
+            if started_session and (not args.leave_session):
+                if _service_is_masked("bluetooth.service"):
+                    print(
+                        "\n[jc2] NOTE: bluetooth.service is masked; leaving jc2 session active "
+                        "(otherwise there would be no bluetooth daemon running).",
+                        file=sys.stderr
+                    )
+                    print("[jc2] To restore normal bluetooth later:", file=sys.stderr)
+                    print("      sudo systemctl unmask bluetooth.service", file=sys.stderr)
+                    print("      sudo systemctl enable --now bluetooth.service", file=sys.stderr)
+                else:
+                    try:
+                        _call_session("stop")
+                    except Exception:
+                        pass
+
         return 0
 
     return 2

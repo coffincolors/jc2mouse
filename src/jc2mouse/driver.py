@@ -200,11 +200,13 @@ class JC2OpticalMouse:
         notify_uuid: str | None = None,
         ctrl_uuid: str | None = None,
         verbose: bool = False,
+        player_id: str = "0001",
     ):
         self.mac = mac.upper()
         self.notify_uuid = (notify_uuid or DEFAULT_NOTIFY_UUID).lower()
         self.ctrl_uuid = (ctrl_uuid or DEFAULT_CTRL_UUID).lower()
         self.verbose = verbose
+        self.player_id = player_id
 
         # Device side: "right" / "left" / "unknown"
         self.side = "unknown"
@@ -776,9 +778,12 @@ class JC2OpticalMouse:
             opts = {"type": Variant("s", "command")}
             await self._ctrl_ch.call_write_value(b, opts)
 
-        async def send_optical_init():
-            await write_cmd("0c91010200040000ff000000")
-            await write_cmd("0c91010400040000ff000000")
+        async def send_initCommands():
+            await write_cmd("0A9101020004000003000000") # "Paired" double-rumble
+            playerIDcmd = f"09910007000800000{int(self.player_id, 2):X}00000000000000"
+            await write_cmd(playerIDcmd) # Player ID
+            await write_cmd("0c91010200040000ff000000") # Init
+            await write_cmd("0c91010400040000ff000000") # Starts Stream
 
         # Serialize bringup so watchdog + startup can't fight each other.
         async with self._bringup_lock:
@@ -800,7 +805,7 @@ class JC2OpticalMouse:
 
                 await safe_start_notify()
                 await asyncio.sleep(delay_s)
-                await send_optical_init()
+                await send_initCommands()
 
                 # Make sure we are actually receiving notifications (handler increments _notif_count).
                 if await self._wait_first_notification(timeout_s=60.0):
@@ -1515,7 +1520,7 @@ class JC2OpticalMouse:
         self._pump_task = asyncio.create_task(_pump())
 
 
-async def run(mac: str, *, status: bool = True, status_hz: float = 5.0, verbose: bool = False):
+async def run(mac: str, *, status: bool = True, status_hz: float = 5.0, verbose: bool = False, player_id: str = "0001"):
     """
     New-kernel resilient bringup:
       - Keep retrying connect+start if BlueZ drops during gatt-client init.
@@ -1527,7 +1532,7 @@ async def run(mac: str, *, status: bool = True, status_hz: float = 5.0, verbose:
 
     while True:
         attempt += 1
-        drv = JC2OpticalMouse(mac, verbose=verbose)
+        drv = JC2OpticalMouse(mac, verbose=verbose, player_id=player_id)
 
         try:
             _stderr(f"[jc2] Bringup attempt {attempt} ...")
@@ -1646,10 +1651,11 @@ class _JC2Endpoint:
     No uinput here — Combined controller owns uinput.
     """
 
-    def __init__(self, mac: str, *, expected_side: str, verbose: bool = False):
+    def __init__(self, mac: str, *, expected_side: str, verbose: bool = False, player_id: str = "0001"):
         self.mac = mac.upper()
         self.expected_side = expected_side  # "left" or "right"
         self.verbose = verbose
+        self.player_id = player_id
 
         self.notify_uuid = DEFAULT_NOTIFY_UUID.lower()
         self.ctrl_uuid = DEFAULT_CTRL_UUID.lower()
@@ -2192,13 +2198,16 @@ class _JC2Endpoint:
             opts = {"type": Variant("s", "command")}
             await self._ctrl_ch.call_write_value(b, opts)
 
-        async def send_optical_init():
-            await write_cmd("0c91010200040000ff000000")
-            await write_cmd("0c91010400040000ff000000")
+        async def send_initCommands():
+            await write_cmd("0A9101020004000003000000") # "Paired" double-rumble
+            playerIDcmd = f"09910007000800000{int(self.player_id, 2):X}00000000000000"
+            await write_cmd(playerIDcmd) # Player ID
+            await write_cmd("0c91010200040000ff000000") # Init
+            await write_cmd("0c91010400040000ff000000") # Starts Data Stream
 
         await safe_start_notify()
         await asyncio.sleep(0.20)
-        await send_optical_init()
+        await send_initCommands()
 
     async def disconnect(self):
         if self._dev is None:
@@ -2315,6 +2324,7 @@ async def run_combined(
     status: bool = True,
     status_hz: float = 5.0,
     verbose: bool = False,
+    player_id: str = "0001"
 ):
     """
     Combined full controller:
@@ -2325,8 +2335,8 @@ async def run_combined(
            * Right gamepad contributions are suppressed
            * Left continues to feed gamepad
     """
-    left = _JC2Endpoint(left_mac, expected_side="left", verbose=verbose)
-    right = _JC2Endpoint(right_mac, expected_side="right", verbose=verbose)
+    left = _JC2Endpoint(left_mac, expected_side="left", verbose=verbose, player_id=player_id)
+    right = _JC2Endpoint(right_mac, expected_side="right", verbose=verbose, player_id=player_id)
     ui = _CombinedUInput(left_mac=left_mac, right_mac=right_mac, verbose=verbose)
 
     right_mouse_mode = False

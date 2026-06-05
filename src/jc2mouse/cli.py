@@ -411,6 +411,7 @@ def main():
     p_run.add_argument("--no-status", action="store_true", help="Disable the one-line status output")
     p_run.add_argument("--status-hz", type=float, default=5.0, help="Status refresh rate (default: 5 Hz)")
     p_run.add_argument("--verbose", action="store_true", help="Developer verbosity (rarely needed)")
+    p_run.add_argument("--player-id", default="0001", help="Player ID: 4-char binary string (e.g. 0001), 0 is off, 1 is on")
 
     # QoL / lifecycle
     p_run.add_argument(
@@ -514,6 +515,10 @@ def main():
         return 0
 
     if args.cmd == "run":
+        if len(args.player_id) != 4 or any(c not in "01" for c in args.player_id):
+            print("ERROR: --player-id must be a 4-character binary string, e.g. 0001", file=sys.stderr)
+            return 1
+
         started_session = False
         chosen_macs: List[str] = []
         chosen_side: str = "unknown"
@@ -576,6 +581,7 @@ def main():
                         status=(not args.no_status),
                         status_hz=args.status_hz,
                         verbose=args.verbose,
+                        player_id=args.player_id,
                     )
                 except DBusError as ex:
                     msg = _friendly_connect_error(ex)
@@ -680,6 +686,7 @@ def main():
                         status=(not args.no_status),
                         status_hz=args.status_hz,
                         verbose=args.verbose,
+                        player_id=args.player_id,
                     )
             except DBusError as ex:
                 msg = _friendly_connect_error(ex)

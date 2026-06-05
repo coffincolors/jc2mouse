@@ -515,7 +515,7 @@ def main():
         return 0
 
     if args.cmd == "run":
-        if len(args.player_id) != 4 or any(c not in "01" for c in args.test):
+        if len(args.player_id) != 4 or any(c not in "01" for c in args.player_id):
             print("ERROR: --player-id must be a 4-character binary string, e.g. 0001", file=sys.stderr)
             return 1
 

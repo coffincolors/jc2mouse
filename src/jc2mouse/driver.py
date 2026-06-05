@@ -776,9 +776,13 @@ class JC2OpticalMouse:
             opts = {"type": Variant("s", "command")}
             await self._ctrl_ch.call_write_value(b, opts)
 
-        async def send_optical_init():
-            await write_cmd("0c91010200040000ff000000")
-            await write_cmd("0c91010400040000ff000000")
+        async def send_initCommands():
+            playerID = "0001" # 4 Bit 0000 to 1111
+            await write_cmd("0A9101020004000003000000") # "Paired" double-rumble
+            playerIDcmd = f"09910007000800000{int(playerID, 2):X}00000000000000"
+            await write_cmd(playerIDcmd) # Player ID
+            await write_cmd("0c91010200040000ff000000") # Init
+            await write_cmd("0c91010400040000ff000000") # Starts Stream
 
         # Serialize bringup so watchdog + startup can't fight each other.
         async with self._bringup_lock:
@@ -800,7 +804,7 @@ class JC2OpticalMouse:
 
                 await safe_start_notify()
                 await asyncio.sleep(delay_s)
-                await send_optical_init()
+                await send_initCommands()
 
                 # Make sure we are actually receiving notifications (handler increments _notif_count).
                 if await self._wait_first_notification(timeout_s=60.0):
@@ -2192,13 +2196,17 @@ class _JC2Endpoint:
             opts = {"type": Variant("s", "command")}
             await self._ctrl_ch.call_write_value(b, opts)
 
-        async def send_optical_init():
-            await write_cmd("0c91010200040000ff000000")
-            await write_cmd("0c91010400040000ff000000")
+        async def send_initCommands():
+            playerID = "0001" # 4 Bit 0000 to 1111
+            await write_cmd("0A9101020004000003000000") # "Paired" double-rumble
+            playerIDcmd = f"09910007000800000{int(playerID, 2):X}00000000000000"
+            await write_cmd(playerIDcmd) # Player ID
+            await write_cmd("0c91010200040000ff000000") # Init
+            await write_cmd("0c91010400040000ff000000") # Starts Stream
 
         await safe_start_notify()
         await asyncio.sleep(0.20)
-        await send_optical_init()
+        await send_initCommands()
 
     async def disconnect(self):
         if self._dev is None:

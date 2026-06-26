@@ -12,6 +12,7 @@ install -Dm644 systemd/jc2-bluetooth.service /etc/systemd/system/jc2-bluetooth.s
 # Install helper script
 install -Dm755 scripts/jc2-session.sh /usr/local/sbin/jc2-session
 
+systemctl unmask bluetooth.service >/dev/null 2>&1 || true
 systemctl daemon-reload
 
 echo "[setup] Installed:"

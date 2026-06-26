@@ -13,7 +13,7 @@ PREFIX="${PREFIX:-/opt/jc2mouse/bluez}"
 JC2_PATCH_GATT_SECONDARY_TIMEOUT="${JC2_PATCH_GATT_SECONDARY_TIMEOUT:-1}"
 JC2_PATCH_ATT_SECONDARY_TIMEOUT="${JC2_PATCH_ATT_SECONDARY_TIMEOUT:-1}"
 JC2_TRACE_TIMEOUT_OPCODE10="${JC2_TRACE_TIMEOUT_OPCODE10:-1}"
-JC2_SKIP_SECONDARY_DISCOVERY="${JC2_SKIP_SECONDARY_DISCOVERY:-0}"
+JC2_SKIP_SECONDARY_DISCOVERY="${JC2_SKIP_SECONDARY_DISCOVERY:-1}"
 JC2_FORCE_UNPAIRED_MEDIUM="${JC2_FORCE_UNPAIRED_MEDIUM:-0}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -35,6 +35,8 @@ ensure_deps() {
   command -v gcc >/dev/null || { echo "Missing gcc" >&2; exit 1; }
   command -v python3 >/dev/null || { echo "Missing python3" >&2; exit 1; }
   command -v tar >/dev/null || { echo "Missing tar" >&2; exit 1; }
+  command -v pkg-config >/dev/null || { echo "Missing pkg-config" >&2; exit 1; }
+  pkg-config --exists libicalvcal || { echo "Missing libicalvcal (install Arch package: libical)" >&2; exit 1; }
 }
 
 fetch() {
@@ -726,8 +728,11 @@ build_and_install() {
   mkdir -p "${BLD_DIR}"
   cd "${SRC_DIR}/bluez-${BLUEZ_VER}"
 
+  local ical_libs
+  ical_libs="$(pkg-config --libs libicalvcal)"
+
   echo "[bluez] Configuring..."
-  ./configure \
+  ICAL_LIBS="${ical_libs}" ./configure \
     --prefix="${PREFIX}" \
     --sysconfdir=/etc \
     --localstatedir=/var \
@@ -735,7 +740,7 @@ build_and_install() {
     --disable-systemd
 
   echo "[bluez] Building..."
-  make -j"$(nproc)"
+  make ICAL_LIBS="${ical_libs}" -j"$(nproc)"
 
   echo "[bluez] Installing to ${PREFIX}..."
   rm -rf "${PREFIX}"

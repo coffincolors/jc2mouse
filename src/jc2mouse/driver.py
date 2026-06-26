@@ -53,6 +53,7 @@ BLUEZ = "org.bluez"
 OM_IFACE = "org.freedesktop.DBus.ObjectManager"
 PROP_IFACE = "org.freedesktop.DBus.Properties"
 DEVICE_IFACE = "org.bluez.Device1"
+ADAPTER_IFACE = "org.bluez.Adapter1"
 GATT_CHRC_IFACE = "org.bluez.GattCharacteristic1"
 
 # ---- Joy-Con 2 identification + side detection via ManufacturerData ----
@@ -1722,6 +1723,78 @@ class _JC2Endpoint:
         om = om_obj.get_interface(OM_IFACE)
         return await om.call_get_managed_objects()
 
+    def _find_adapters(self):
+        return sorted([p for p, ifaces in self.objects.items() if ADAPTER_IFACE in ifaces])
+
+    def _device_candidate_matches(self, path: str, ifaces) -> bool:
+        dev = ifaces.get(DEVICE_IFACE)
+        if not dev:
+            return False
+
+        addr = str(_unwrap(dev.get("Address")) or "").upper()
+        if addr != self.mac:
+            return False
+
+        mfg_map = _unwrap(dev.get("ManufacturerData"))
+        if not isinstance(mfg_map, dict) or NINTENDO_COMPANY_ID not in mfg_map:
+            return True
+
+        try:
+            mfg = bytes(_unwrap(mfg_map[NINTENDO_COMPANY_ID]))
+        except Exception:
+            return True
+
+        if len(mfg) != JC2_MFG_LEN or not mfg.startswith(JC2_MFG_PREFIX):
+            return True
+
+        side_byte = mfg[JC2_SIDE_BYTE_IDX]
+        side = "right" if side_byte == JC2_SIDE_RIGHT else "left" if side_byte == JC2_SIDE_LEFT else "unknown"
+        return side in ("unknown", self.expected_side)
+
+    async def _rediscover_device_path(self, timeout_s: float = 10.0) -> str | None:
+        """
+        BlueZ can drop a Joy-Con Device1 object when it leaves pair mode. Restart
+        discovery and wait for the exact MAC to reappear before retrying Connect.
+        """
+        self.objects = await self._get_managed_objects()
+        adapters = self._find_adapters()
+        if not adapters:
+            return None
+
+        adapter_path = next((p for p in adapters if p.endswith("/hci0")), adapters[0])
+        ad_intro = await self.bus.introspect(BLUEZ, adapter_path)
+        ad_obj = self.bus.get_proxy_object(BLUEZ, adapter_path, ad_intro)
+        adapter = ad_obj.get_interface(ADAPTER_IFACE)
+        props = ad_obj.get_interface(PROP_IFACE)
+
+        try:
+            await props.call_set(ADAPTER_IFACE, "Powered", Variant("b", True))
+        except Exception:
+            pass
+
+        try:
+            await adapter.call_start_discovery()
+        except Exception as ex:
+            msg = str(ex)
+            if "In Progress" not in msg and "InProgress" not in msg:
+                raise
+
+        try:
+            deadline = time.time() + timeout_s
+            while time.time() < deadline:
+                self.objects = await self._get_managed_objects()
+                for path, ifaces in self.objects.items():
+                    if self._device_candidate_matches(path, ifaces):
+                        return path
+                await asyncio.sleep(0.25)
+        finally:
+            try:
+                await adapter.call_stop_discovery()
+            except Exception:
+                pass
+
+        return None
+
     def _find_device_path(self):
         suffix = "dev_" + self.mac.replace(":", "_")
         for path, ifaces in self.objects.items():
@@ -2105,7 +2178,13 @@ class _JC2Endpoint:
     async def connect(self):
         self.bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
         self.objects = await self._get_managed_objects()
-        self.dev_path = self._find_device_path()
+        try:
+            self.dev_path = self._find_device_path()
+        except RuntimeError:
+            _stderr(f"[jc2] {self.expected_side.upper()}: waiting for {self.mac} to reappear in BlueZ...")
+            self.dev_path = await self._rediscover_device_path(timeout_s=12.0)
+            if not self.dev_path:
+                raise RuntimeError(f"Device {self.mac} not found in BlueZ object tree.")
 
         dev_intro = await self.bus.introspect(BLUEZ, self.dev_path)
         dev_obj = self.bus.get_proxy_object(BLUEZ, self.dev_path, dev_intro)

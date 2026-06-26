@@ -2,8 +2,6 @@
 Description=jc2mouse patched bluetoothd (session mode)
 After=dbus.service
 Conflicts=bluetooth.service
-# If your distro uses bluetooth.target, you can add:
-# Conflicts=bluetooth.target
 
 [Service]
 Type=simple
